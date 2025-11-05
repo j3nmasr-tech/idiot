@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SIRTS v11 Swing — Top 80 | Binance.US + symbol sanitization + Aggressive Mode + Smart Filters
+# SIRTS v11 Swing — Top 80 | Binance (global)
 # Swing adaptation: EMA200 wave confirmation (1H / 4H / Daily)
 # Signals only (no automation). Requires: requests, pandas, numpy
 # ENV: BOT_TOKEN, CHAT_ID, DEBUG_LEVEL (TRACE/INFO/OFF)
@@ -55,18 +55,18 @@ WEIGHT_TURTLE = 0.25
 WEIGHT_CRT    = 0.20
 WEIGHT_VOLUME = 0.15
 
-# ===== Aggressive-mode defaults (kept from scalp) =====
+# ===== Ultra-safe swing defaults (you chose B) =====
 MIN_TF_SCORE  = 55
-CONF_MIN_TFS  = 2
+CONF_MIN_TFS  = 3       # REQUIRE 3 out of 3 (ultra safe)
 CONFIDENCE_MIN = 60.0
 
 MIN_QUOTE_VOLUME = 1_000_000.0
 TOP_SYMBOLS = 80
 
-# ===== BINANCE .US ENDPOINTS =====
-BINANCE_KLINES = "https://api.binance.us/api/v3/klines"
-BINANCE_PRICE  = "https://api.binance.us/api/v3/ticker/price"
-BINANCE_24H    = "https://api.binance.us/api/v3/ticker/24hr"
+# ===== BINANCE global ENDPOINTS =====
+BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+BINANCE_PRICE  = "https://api.binance.com/api/v3/ticker/price"
+BINANCE_24H    = "https://api.binance.com/api/v3/ticker/24hr"
 FNG_API        = "https://api.alternative.me/fng/?limit=1"
 
 LOG_CSV = "./sirts_v11_swing_signals.csv"
@@ -111,19 +111,20 @@ STATS = {
 
 # ===== HELPERS =====
 def send_message(text):
+    # Plain text to avoid Telegram markdown escaping issues
     if not BOT_TOKEN or not CHAT_ID:
         dbg("Telegram not configured; msg not sent", "INFO")
         dbg(text, "TRACE")
         return False
     try:
         requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      data={"chat_id": CHAT_ID, "text": text, "parse_mode":"MarkdownV2"}, timeout=10)
+                      data={"chat_id": CHAT_ID, "text": text}, timeout=10)
         return True
     except Exception as e:
         dbg(f"Telegram send error: {e}", "INFO")
         return False
 
-def safe_get_json(url, params=None, timeout=6, retries=1):
+def safe_get_json(url, params=None, timeout=8, retries=1):
     for attempt in range(retries + 1):
         try:
             r = requests.get(url, params=params, timeout=timeout)
@@ -132,7 +133,7 @@ def safe_get_json(url, params=None, timeout=6, retries=1):
         except requests.exceptions.RequestException as e:
             dbg(f"API request error ({e}) for {url} params={params} attempt={attempt+1}/{retries+1}", "TRACE")
             if attempt < retries:
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(0.6 * (attempt + 1))
                 continue
             return None
         except Exception as e:
@@ -140,7 +141,7 @@ def safe_get_json(url, params=None, timeout=6, retries=1):
             return None
 
 def get_top_symbols(n=TOP_SYMBOLS):
-    data = safe_get_json(BINANCE_24H, {}, timeout=6, retries=1)
+    data = safe_get_json(BINANCE_24H, {}, timeout=8, retries=1)
     if not data:
         return ["BTCUSDT","ETHUSDT"]
     usdt = [d for d in data if d.get("symbol","").endswith("USDT")]
@@ -153,7 +154,7 @@ def get_24h_quote_volume(symbol):
     symbol = sanitize_symbol(symbol)
     if not symbol:
         return 0.0
-    j = safe_get_json(BINANCE_24H, {"symbol": symbol}, timeout=6, retries=1)
+    j = safe_get_json(BINANCE_24H, {"symbol": symbol}, timeout=8, retries=1)
     try:
         return float(j.get("quoteVolume", 0)) if j else 0.0
     except Exception:
@@ -163,7 +164,7 @@ def get_klines(symbol, interval="1h", limit=200):
     symbol = sanitize_symbol(symbol)
     if not symbol:
         return None
-    data = safe_get_json(BINANCE_KLINES, {"symbol":symbol,"interval":interval,"limit":limit}, timeout=6, retries=1)
+    data = safe_get_json(BINANCE_KLINES, {"symbol":symbol,"interval":interval,"limit":limit}, timeout=8, retries=1)
     if not isinstance(data, list):
         return None
     df = pd.DataFrame(data, columns=["t","o","h","l","c","v","ct","qv","tr","tb","tq","ig"])
@@ -361,7 +362,7 @@ def log_trade_close(trade):
         with open(LOG_CSV,"a", newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
-                datetime.utcnow().isoformat(), trade["s"], trade["side"], trade.get("entry"),
+                datetime.now(timezone.utc).isoformat(), trade["s"], trade["side"], trade.get("entry"),
                 trade.get("tp1"), trade.get("tp2"), trade.get("tp3"), trade.get("sl"),
                 trade.get("entry_tf"), trade.get("units"), trade.get("margin"), trade.get("exposure"),
                 trade.get("risk_pct")*100 if trade.get("risk_pct") else None, trade.get("confidence_pct"),
@@ -375,12 +376,6 @@ def ema(series, span):
     return series.ewm(span=span).mean()
 
 def wave_swing_ok(symbol, side, entry_price):
-    """
-    Require:
-      - 4H and Daily trend in same direction and aligned with side
-      - Price pulled back near EMA200 on 1H or 4H (within thresholds)
-      - A CRT reversal on 1H (small confirmation)
-    """
     try:
         df1 = get_klines(symbol, "1h", limit=400)
         df4 = get_klines(symbol, "4h", limit=400)
@@ -389,15 +384,16 @@ def wave_swing_ok(symbol, side, entry_price):
             dbg(f"wave_swing_ok: missing data for {symbol}", "TRACE")
             return False
 
-        # EMA200 on 4H & Daily
-        if len(df4) < 210 or len(d1) < 210:
+        if len(df4) < 210 or len(d1) < 210 or len(df1) < 210:
             dbg(f"wave_swing_ok: insufficient length for EMA200 for {symbol}", "TRACE")
             return False
 
         ema200_4h = ema(df4["close"], span=200).iloc[-1]
         ema200_d  = ema(d1["close"], span=200).iloc[-1]
+        ema200_1h = ema(df1["close"], span=200).iloc[-1]
         close4h = df4["close"].iloc[-1]
         closed = d1["close"].iloc[-1]
+        price = float(entry_price)
 
         # Trend check: both 4H & Daily must agree with side
         if side == "BUY":
@@ -410,18 +406,12 @@ def wave_swing_ok(symbol, side, entry_price):
                 return False
 
         # Pullback: check proximity to EMA200 on 1H or 4H
-        ema200_1h = ema(df1["close"], span=200).iloc[-1]
-        price = float(entry_price)
-        # thresholds (tunable)
-        PCT_ABOVE_MAX = 0.02   # price can be up to 2% above EMA (still acceptable)
-        PCT_BELOW_MAX = 0.03   # price can be up to 3% below EMA (acceptable for pullback)
-        # choose the TF (prefer 1H if close to its EMA, else 4H)
+        PCT_ABOVE_MAX = 0.02
+        PCT_BELOW_MAX = 0.03
         diff1 = (price - ema200_1h) / ema200_1h
         diff4 = (price - ema200_4h) / ema200_4h
-
         ok1 = (-PCT_BELOW_MAX <= diff1 <= PCT_ABOVE_MAX)
         ok4 = (-PCT_BELOW_MAX <= diff4 <= PCT_ABOVE_MAX)
-
         if not (ok1 or ok4):
             dbg(f"{symbol} wave fail: price not near EMA200 (diff1={diff1:.3f}, diff4={diff4:.3f})", "TRACE")
             return False
@@ -461,7 +451,7 @@ def get_btc_30m_bias():
         return None
     return smc_bias(df)
 
-# ===== ANALYSIS & SIGNAL GENERATION (using your analyze_symbol logic with wave check) =====
+# ===== ANALYSIS & SIGNAL GENERATION =====
 def current_total_exposure():
     return sum([t.get("exposure", 0) for t in open_trades if t.get("st") == "open"])
 
@@ -505,7 +495,6 @@ def analyze_symbol(symbol):
             continue
 
         tf_index = TIMEFRAMES.index(tf)
-        # for swing, allow strict TF agree but keep your flag
         if tf_index < len(TIMEFRAMES) - 1:
             higher_tf = TIMEFRAMES[tf_index + 1]
             if not tf_agree(symbol, tf, higher_tf):
@@ -586,7 +575,7 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
 
-    # ----- BTC correlation filter -----
+    # BTC correlation filter
     btc30_bias = get_btc_30m_bias()
     if btc30_bias is not None:
         if chosen_dir == "BUY" and btc30_bias == "bear":
@@ -598,7 +587,7 @@ def analyze_symbol(symbol):
             skipped_signals += 1
             return False
 
-    # ----- Dual bias flip rule for reversal trades -----
+    # Dual bias flip rule for reversal trades
     try:
         higher_tf = "4h" if chosen_tf == "1h" else ("1d" if chosen_tf == "4h" else "1d")
     except Exception:
@@ -615,7 +604,7 @@ def analyze_symbol(symbol):
                 skipped_signals += 1
                 return False
 
-    # ----- volume consistency check on chosen timeframe -----
+    # volume consistency on chosen timeframe
     df_chosen = get_klines(symbol, chosen_tf, limit=120)
     if df_chosen is None or len(df_chosen) < 10:
         skipped_signals += 1
@@ -625,7 +614,7 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
 
-    # ----- SWING WAVE FILTER (EMA200 + pullback + CRT on 1H) -----
+    # SWING WAVE FILTER (EMA200 + pullback + CRT on 1H)
     if not wave_swing_ok(symbol, chosen_dir, entry):
         dbg(f"Skipping {symbol}: wave swing filter failed.", "TRACE")
         skipped_signals += 1
@@ -649,13 +638,15 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
 
-    header = (f"📈 *SWING {chosen_dir} {symbol}*\n"
-              f"Entry: `{entry}`\n"
-              f"TP1: `{tp1}` TP2: `{tp2}` TP3: `{tp3}`\n"
-              f"SL: `{sl}`\n"
-              f"Units: {units} | Margin≈${margin} | Exposure≈${exposure}\n"
-              f"Risk used: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}% | Sentiment:{sentiment}\n"
-              f"TF: {chosen_tf}")
+    header = (
+        f"SWING {chosen_dir} {symbol}\n"
+        f"Entry: {entry}\n"
+        f"TP1: {tp1}  TP2: {tp2}  TP3: {tp3}\n"
+        f"SL: {sl}\n"
+        f"Units: {units} | Margin≈${margin} | Exposure≈${exposure}\n"
+        f"Risk used: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}% | Sentiment:{sentiment}\n"
+        f"TF: {chosen_tf}"
+    )
     send_message(header)
 
     last_directional_trade[dir_key] = time.time()
@@ -686,14 +677,14 @@ def analyze_symbol(symbol):
     if chosen_tf in STATS["by_tf"]:
         STATS["by_tf"][chosen_tf]["sent"] += 1
     log_signal([
-        datetime.utcnow().isoformat(), symbol, chosen_dir, entry,
+        datetime.now(timezone.utc).isoformat(), symbol, chosen_dir, entry,
         tp1, tp2, tp3, sl, chosen_tf, units, margin, exposure,
         risk_used*100, confidence_pct, "open", str(breakdown_per_tf)
     ])
     dbg(f"✅ Signal sent for {symbol} at entry {entry}. Confidence {confidence_pct:.1f}%", "INFO")
     return True
 
-# ===== TRADE CHECK (TP/SL/BREAKEVEN) - kept in case you want to track open_trades file-wise =====
+# ===== TRADE CHECK (TP/SL/BREAKEVEN) =====
 def check_trades():
     global signals_hit_total, signals_fail_total, signals_breakeven, STATS, last_trade_time, last_trade_result
     for t in list(open_trades):
@@ -703,12 +694,11 @@ def check_trades():
         if p is None:
             continue
         side = t["side"]
-        # BUY logic
         if side == "BUY":
             if not t["tp1_taken"] and p >= t["tp1"]:
                 t["tp1_taken"] = True
                 t["sl"] = t["entry"]
-                send_message(f"🎯 {t['s']} TP1 Hit {p} — SL moved to breakeven.")
+                send_message(f"TP1 Hit {t['s']} {p} — SL moved to breakeven.")
                 STATS["by_side"]["BUY"]["hit"] += 1
                 STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
@@ -717,7 +707,7 @@ def check_trades():
                 continue
             if t["tp1_taken"] and not t["tp2_taken"] and p >= t["tp2"]:
                 t["tp2_taken"] = True
-                send_message(f"🎯 {t['s']} TP2 Hit {p}")
+                send_message(f"TP2 Hit {t['s']} {p}")
                 STATS["by_side"]["BUY"]["hit"] += 1
                 STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
@@ -727,7 +717,7 @@ def check_trades():
             if t["tp2_taken"] and not t["tp3_taken"] and p >= t["tp3"]:
                 t["tp3_taken"] = True
                 t["st"] = "closed"
-                send_message(f"🏁 {t['s']} TP3 Hit {p} — Trade closed.")
+                send_message(f"TP3 Hit {t['s']} {p} — Trade closed.")
                 STATS["by_side"]["BUY"]["hit"] += 1
                 STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
@@ -741,7 +731,7 @@ def check_trades():
                     signals_breakeven += 1
                     STATS["by_side"]["BUY"]["breakeven"] += 1
                     STATS["by_tf"][t["entry_tf"]]["breakeven"] += 1
-                    send_message(f"⚖️ {t['s']} Breakeven SL Hit {p}")
+                    send_message(f"Breakeven SL Hit {t['s']} {p}")
                     last_trade_result[t["s"]] = "breakeven"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
                     log_trade_close(t)
@@ -750,7 +740,7 @@ def check_trades():
                     signals_fail_total += 1
                     STATS["by_side"]["BUY"]["fail"] += 1
                     STATS["by_tf"][t["entry_tf"]]["fail"] += 1
-                    send_message(f"❌ {t['s']} SL Hit {p}")
+                    send_message(f"SL Hit {t['s']} {p}")
                     last_trade_result[t["s"]] = "loss"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_FAIL
                     log_trade_close(t)
@@ -758,7 +748,7 @@ def check_trades():
             if not t["tp1_taken"] and p <= t["tp1"]:
                 t["tp1_taken"] = True
                 t["sl"] = t["entry"]
-                send_message(f"🎯 {t['s']} TP1 Hit {p} — SL moved to breakeven.")
+                send_message(f"TP1 Hit {t['s']} {p} — SL moved to breakeven.")
                 STATS["by_side"]["SELL"]["hit"] += 1
                 STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
@@ -767,7 +757,7 @@ def check_trades():
                 continue
             if t["tp1_taken"] and not t["tp2_taken"] and p <= t["tp2"]:
                 t["tp2_taken"] = True
-                send_message(f"🎯 {t['s']} TP2 Hit {p}")
+                send_message(f"TP2 Hit {t['s']} {p}")
                 STATS["by_side"]["SELL"]["hit"] += 1
                 STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
@@ -777,7 +767,7 @@ def check_trades():
             if t["tp2_taken"] and not t["tp3_taken"] and p <= t["tp3"]:
                 t["tp3_taken"] = True
                 t["st"] = "closed"
-                send_message(f"🏁 {t['s']} TP3 Hit {p} — Trade closed.")
+                send_message(f"TP3 Hit {t['s']} {p} — Trade closed.")
                 STATS["by_side"]["SELL"]["hit"] += 1
                 STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
@@ -791,7 +781,7 @@ def check_trades():
                     signals_breakeven += 1
                     STATS["by_side"]["SELL"]["breakeven"] += 1
                     STATS["by_tf"][t["entry_tf"]]["breakeven"] += 1
-                    send_message(f"⚖️ {t['s']} Breakeven SL Hit {p}")
+                    send_message(f"Breakeven SL Hit {t['s']} {p}")
                     last_trade_result[t["s"]] = "breakeven"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
                     log_trade_close(t)
@@ -800,7 +790,7 @@ def check_trades():
                     signals_fail_total += 1
                     STATS["by_side"]["SELL"]["fail"] += 1
                     STATS["by_tf"][t["entry_tf"]]["fail"] += 1
-                    send_message(f"❌ {t['s']} SL Hit {p}")
+                    send_message(f"SL Hit {t['s']} {p}")
                     last_trade_result[t["s"]] = "loss"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_FAIL
                     log_trade_close(t)
@@ -815,7 +805,7 @@ def check_trades():
 
 # ===== HEARTBEAT & SUMMARY =====
 def heartbeat():
-    send_message(f"💓 Heartbeat OK {datetime.utcnow().strftime('%H:%M UTC')}")
+    send_message(f"💓 Heartbeat OK {datetime.now(timezone.utc).strftime('%H:%M UTC')}")
     dbg("Heartbeat sent.", "INFO")
 
 def summary():
@@ -829,7 +819,7 @@ def summary():
 
 # ===== STARTUP =====
 init_csv()
-send_msg("✅ SIRTS v11 Swing Top80 (Binance.US) deployed — EMA200 Swing Filters active.")
+send_message("✅ SIRTS v11 Swing Top80 (Binance) deployed — EMA200 Swing Filters active.")
 dbg("SIRTS v11 Swing deployed.", "INFO")
 
 try:
@@ -855,7 +845,7 @@ while True:
                 dbg(f"Error scanning {sym}: {e}", "INFO")
             time.sleep(API_CALL_DELAY)
 
-        # We keep trade checking to update CSV / bookkeeping (no automation)
+        # Keep trade checking to update CSV / bookkeeping (no automation)
         check_trades()
 
         now = time.time()
