@@ -57,8 +57,8 @@ WEIGHT_VOLUME = 0.15
 
 # ===== Ultra-safe swing defaults (you chose B) =====
 MIN_TF_SCORE  = 55
-CONF_MIN_TFS  = 3       # REQUIRE 3 out of 3 (ultra safe)
-CONFIDENCE_MIN = 60.0
+CONF_MIN_TFS  = 2       # REQUIRE 3 out of 3 (ultra safe)
+CONFIDENCE_MIN = 55.0
 
 MIN_QUOTE_VOLUME = 1_000_000.0
 TOP_SYMBOLS = 80
