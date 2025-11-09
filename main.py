@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-# SIRTS v10 — Swing Top-5 | Bybit USDT Perps — 1H/4H/Daily swing, 2/3 TF agree, Balanced TP (P2), News filter (N2), Telegram signals (T2)
+# SIRTS v10 — Swing Top-10 | Bybit USDT Perps — Ultra-Safe: BTC master filter (1H/4H/1D agree) + BTC 4H ADX >=20 + Dominance <=55%
 # Requirements: requests, pandas, numpy
 # Environment variables:
 #   BOT_TOKEN (Telegram bot token)
 #   CHAT_ID  (Telegram chat id)
 #   NEWS_API_KEY (optional; Finnhub API token to fetch economic calendar)
-# Notes: preserves your original SIRTS logic, only changes TFs, TP sizing and adds news filter & top5 list.
+# Notes: preserves your original SIRTS logic, only changes TFs, TP sizing and adds news filter & top10 list + BTC health checks.
 
 import os
 import re
@@ -16,6 +16,7 @@ import numpy as np
 from datetime import datetime, timedelta
 import csv
 import calendar
+import math
 
 # ===== SYMBOL SANITIZATION =====
 def sanitize_symbol(symbol: str) -> str:
@@ -49,23 +50,24 @@ WEIGHT_TURTLE = 0.25
 WEIGHT_CRT    = 0.20
 WEIGHT_VOLUME = 0.15
 
-# ===== CONFIDENCE & SIZING DEFAULTS (C1) =====
+# ===== CONFIDENCE & SIZING DEFAULTS (Ultra-Safe) =====
 MIN_TF_SCORE  = 55      # per-TF threshold
-CONF_MIN_TFS  = 2       # require 2 out of 3 timeframes to agree (2/3)
+CONF_MIN_TFS  = 2       # require 3 out of 3 timeframes to agree (Ultra-Safe)
 CONFIDENCE_MIN = 60.0   # overall minimum confidence %
 
 MIN_QUOTE_VOLUME = 1_000_000.0
-TOP_SYMBOLS = 5
+TOP_SYMBOLS = 10
 
 # ===== BYBIT ENDPOINTS (USDT Perpetual data) =====
 BYBIT_KLINES = "https://api.bybit.com/v5/market/kline"
 BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
 FNG_API        = "https://api.alternative.me/fng/?limit=1"
+COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
 
-LOG_CSV = "./sirts_v10_swing_signals.csv"
+LOG_CSV = "./sirts_v10_swing_signals_top10.csv"
 
 # ===== NEW SAFEGUARDS =====
-STRICT_TF_AGREE = False
+STRICT_TF_AGREE = True
 MAX_OPEN_TRADES = 6
 MAX_EXPOSURE_PCT = 0.20
 MIN_MARGIN_USD = 0.25
@@ -128,10 +130,13 @@ def safe_get_json(url, params=None, timeout=6, retries=2):
             print(f"⚠️ Unexpected error fetching {url}: {e}")
             return None
 
-# ===== TOP5 SYMBOLS =====
-def get_top_symbols(n=5):
-    # fixed Top-5 for swing
-    fixed = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
+# ===== TOP10 SYMBOLS =====
+def get_top_symbols(n=10):
+    # fixed Top-10 (exclude stablecoins). Adjust if you prefer different list.
+    fixed = [
+        "BTCUSDT","ETHUSDT","BNBUSDT","XRPUSDT","ADAUSDT",
+        "SOLUSDT","DOGEUSDT","DOTUSDT","LTCUSDT","LINKUSDT"
+    ]
     return fixed[:n]
 
 def get_24h_quote_volume(symbol):
@@ -425,6 +430,120 @@ def log_trade_close(trade):
     except Exception as e:
         print("log_trade_close error:", e)
 
+# ===== BTC ADX & DOMINANCE CHECKS (NEW) =====
+def compute_adx(df, period=14):
+    # df must have columns high, low, close
+    try:
+        high = df["high"].values
+        low = df["low"].values
+        close = df["close"].values
+        length = len(df)
+        if length < period + 2:
+            return None
+        # True Range
+        tr = np.maximum.reduce([high[1:] - low[1:], np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])])
+        # +DM and -DM
+        up_move = high[1:] - high[:-1]
+        down_move = low[:-1] - low[1:]
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        # Wilder smoothing
+        atr = np.zeros_like(tr)
+        atr[0] = np.mean(tr[:period])
+        for i in range(1, len(tr)):
+            atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period
+        plus_dm_s = np.zeros_like(plus_dm)
+        minus_dm_s = np.zeros_like(minus_dm)
+        plus_dm_s[0] = np.mean(plus_dm[:period])
+        minus_dm_s[0] = np.mean(minus_dm[:period])
+        for i in range(1, len(plus_dm)):
+            plus_dm_s[i] = (plus_dm_s[i-1] * (period - 1) + plus_dm[i]) / period
+            minus_dm_s[i] = (minus_dm_s[i-1] * (period - 1) + minus_dm[i]) / period
+        # DI
+        plus_di = 100.0 * (plus_dm_s / atr)
+        minus_di = 100.0 * (minus_dm_s / atr)
+        dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
+        # ADX = SMA of DX
+        adx = np.zeros_like(dx)
+        adx[0] = np.mean(dx[:period])
+        for i in range(1, len(dx)):
+            adx[i] = (adx[i-1] * (period - 1) + dx[i]) / period
+        return float(adx[-1])
+    except Exception as e:
+        print("compute_adx error:", e)
+        return None
+
+def btc_adx_4h_ok(min_adx=20, period=14):
+    df = get_klines("BTCUSDT", "4h", limit=period*6+10)
+    if df is None or len(df) < period + 10:
+        print("⚠️ BTC 4H klines not available for ADX check.")
+        return False
+    adx = compute_adx(df, period=period)
+    if adx is None:
+        return False
+    print(f"BTC 4H ADX: {adx:.2f}")
+    return adx >= min_adx
+
+def get_btc_dominance():
+    j = safe_get_json(COINGECKO_GLOBAL, {}, timeout=5, retries=1)
+    try:
+        m = j.get("data", {}).get("market_cap_percentage", {})
+        btc_pct = m.get("btc") or m.get("btc_dominance") or None
+        if btc_pct is None:
+            return None
+        return float(btc_pct)
+    except Exception:
+        return None
+
+def btc_dominance_ok(max_pct=55.0):
+    dom = get_btc_dominance()
+    if dom is None:
+        print("⚠️ Could not fetch BTC dominance — blocking (ultra-safe).")
+        return False
+    print(f"BTC Dominance: {dom:.2f}% (max allowed {max_pct}%)")
+    return dom <= max_pct
+
+def btc_direction_3tf():
+    # require 1H,4H,1D directions to all match (BUY or SELL)
+    try:
+        dirs = []
+        for tf in TIMEFRAMES:
+            df = get_klines("BTCUSDT", tf, limit=120)
+            if df is None or len(df) < 30:
+                print(f"⚠️ Missing BTC klines for {tf} — blocking (ultra-safe).")
+                return None
+            d = get_direction_from_ma(df)
+            if d is None:
+                print(f"⚠️ Could not determine BTC direction on {tf}.")
+                return None
+            dirs.append(d)
+        all_same = all(x == dirs[0] for x in dirs)
+        print(f"BTC directions: {dirs} -> all_same={all_same}")
+        return dirs[0] if all_same else None
+    except Exception as e:
+        print("btc_direction_3tf error:", e)
+        return None
+
+def btc_health_check():
+    """
+    Ultra-Safe master filter for BTC:
+      - 1H+4H+1D must agree (3/3)
+      - 4H ADX >= 20
+      - BTC dominance <= 55%
+    Returns True only when all checks pass.
+    """
+    dir_ok = btc_direction_3tf()
+    if not dir_ok:
+        print("BTC direction not aligned (3/3).")
+        return False
+    if not btc_adx_4h_ok(min_adx=20, period=14):
+        print("BTC 4H ADX check failed.")
+        return False
+    if not btc_dominance_ok(max_pct=55.0):
+        print("BTC dominance check failed.")
+        return False
+    return True
+
 # ===== BTC VOLATILITY SPIKE FILTER (ADDED) =====
 def btc_volatility_spike(threshold_pct=None, atr_period=14, lookback=80):
     """
@@ -437,11 +556,9 @@ def btc_volatility_spike(threshold_pct=None, atr_period=14, lookback=80):
     if df is None or len(df) < max(atr_period+1, 20):
         return False
     try:
-        # compute TRs
         h = df["high"].values if "high" in df.columns else None
         l = df["low"].values if "low" in df.columns else None
         c = df["close"].values if "close" in df.columns else None
-        # if high/low/close not available from this df structure, try to fetch more detailed klines
         if h is None or l is None or c is None:
             return False
         trs = []
@@ -468,6 +585,16 @@ def analyze_symbol(symbol):
     total_checked_signals += 1
     now_ts = time.time()
     if time.time() < volatility_pause_until:
+        return False
+
+    # Master BTC health check: Ultra-Safe -> if BTC not healthy, block ALL signals (including BTC itself)
+    try:
+        btc_ok = btc_health_check()
+    except Exception:
+        btc_ok = False
+    if not btc_ok:
+        print(f"Skipping {symbol}: BTC master filter not satisfied (ultra-safe).")
+        skipped_signals += 1
         return False
 
     # News filter: don't open new entries during news windows (N2)
@@ -553,6 +680,7 @@ def analyze_symbol(symbol):
 
     print(f"Scanning {symbol}: {tf_confirmations}/{len(TIMEFRAMES)} confirmations. Breakdown: {breakdown_per_tf}")
 
+    # require Ultra-Safe 3/3 agreement (already enforced by CONF_MIN_TFS)
     if not (tf_confirmations >= CONF_MIN_TFS and chosen_dir and chosen_entry is not None):
         return False
 
@@ -782,15 +910,15 @@ def summary():
 
 # ===== STARTUP =====
 init_csv()
-send_message("✅ SIRTS v10 Swing Top5 (Bybit USDT Perps, 1H/4H/1D, 2/3 TF, Balanced TP, News filter N2) deployed — sanitization + swing defaults active.")
-print("✅ SIRTS v10 Swing Top5 deployed.")
+send_message("✅ SIRTS v10 Swing Top10 (Bybit USDT Perps) deployed — Ultra-Safe: BTC master filter (1H+4H+1D agree) + BTC 4H ADX≥20 + Dominance≤55%")
+print("✅ SIRTS v10 Swing Top10 deployed.")
 
 try:
     SYMBOLS = get_top_symbols(TOP_SYMBOLS)
     print(f"Monitoring {len(SYMBOLS)} symbols (Top {TOP_SYMBOLS}).")
 except Exception as e:
-    SYMBOLS = ["BTCUSDT","ETHUSDT","SOLUSDT","BNBUSDT","XRPUSDT"]
-    print("Warning retrieving top symbols, defaulting to fixed Top 5.")
+    SYMBOLS = get_top_symbols(10)
+    print("Warning retrieving top symbols, defaulting to fixed Top 10.")
 
 # ===== MAIN LOOP =====
 while True:
