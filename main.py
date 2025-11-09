@@ -503,11 +503,13 @@ def btc_dominance_ok(max_pct=55.0):
     print(f"BTC Dominance: {dom:.2f}% (max allowed {max_pct}%)")
     return dom <= max_pct
 
+from collections import Counter
+
 def btc_direction_3tf():
-    # require 1H,4H,1D directions to all match (BUY or SELL)
+    # require majority of 3 TFs (1H,4H,1D) to agree (BUY or SELL)
     try:
         dirs = []
-        for tf in TIMEFRAMES:
+        for tf in TIMEFRAMES:  # e.g., ["1h","4h","1d"]
             df = get_klines("BTCUSDT", tf, limit=120)
             if df is None or len(df) < 30:
                 print(f"⚠️ Missing BTC klines for {tf} — blocking (ultra-safe).")
@@ -517,9 +519,15 @@ def btc_direction_3tf():
                 print(f"⚠️ Could not determine BTC direction on {tf}.")
                 return None
             dirs.append(d)
-        all_same = all(x == dirs[0] for x in dirs)
-        print(f"BTC directions: {dirs} -> all_same={all_same}")
-        return dirs[0] if all_same else None
+
+        counts = Counter(dirs)
+        most_common_dir, count = counts.most_common(1)[0]
+        print(f"BTC directions: {dirs} -> majority={most_common_dir} ({count}/3)")
+
+        if count >= 2:
+            return most_common_dir  # majority agrees
+        else:
+            return None  # block if no majority
     except Exception as e:
         print("btc_direction_3tf error:", e)
         return None
@@ -527,14 +535,14 @@ def btc_direction_3tf():
 def btc_health_check():
     """
     Ultra-Safe master filter for BTC:
-      - 1H+4H+1D must agree (3/3)
+      - Majority (2/3) of 1H,4H,1D must agree
       - 4H ADX >= 20
       - BTC dominance <= 55%
     Returns True only when all checks pass.
     """
     dir_ok = btc_direction_3tf()
     if not dir_ok:
-        print("BTC direction not aligned (3/3).")
+        print("BTC direction not aligned (majority 2/3).")
         return False
     if not btc_adx_4h_ok(min_adx=20, period=14):
         print("BTC 4H ADX check failed.")
