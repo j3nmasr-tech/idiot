@@ -720,39 +720,43 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
 
-# BTC 1h correlation filter
-btc1h_bias = get_btc_1h_bias()  # fetch 1-hour BTC bias
-if btc1h_bias is not None:
-    if chosen_dir == "BUY" and btc1h_bias == "bear":
-        dbg(f"Skipping {symbol}: BTC 1h bias is bear; skipping counter-BTC BUY.", "TRACE")
-        skipped_signals += 1
-        return False
-    if chosen_dir == "SELL" and btc1h_bias == "bull":
-        dbg(f"Skipping {symbol}: BTC 1h bias is bull; skipping counter-BTC SELL.", "TRACE")
-        skipped_signals += 1
-        return False
-    # Dual bias flip rule for reversal trades
-    try:
-        higher_tf = "4h" if chosen_tf == "1h" else ("1d" if chosen_tf == "4h" else "1d")
-    except Exception:
-        higher_tf = "4h"
-    df_high = get_klines(symbol, higher_tf, limit=120)
-    bias_high = smc_bias(df_high) if df_high is not None and len(df_high) >= 60 else None
-    if bias_high is not None:
-        is_reversal = (chosen_dir == "BUY" and bias_high == "bear") or (chosen_dir == "SELL" and bias_high == "bull")
-        if is_reversal:
-            flip_1 = bias_recent_flip(symbol, "1h", "bull" if chosen_dir=="BUY" else "bear", lookback_candles=3)
-            flip_4 = bias_recent_flip(symbol, "4h", "bull" if chosen_dir=="BUY" else "bear", lookback_candles=3)
-            if not (flip_1 and flip_4):
-                dbg(f"Skipping {symbol}: reversal detected but dual bias flip missing (1h:{flip_1},4h:{flip_4}).", "TRACE")
-                skipped_signals += 1
-                return False
+    # BTC 1h correlation filter
+    btc1h_bias = get_btc_1h_bias()  # fetch 1-hour BTC bias
+    if btc1h_bias is not None:
+        if chosen_dir == "BUY" and btc1h_bias == "bear":
+            dbg(f"Skipping {symbol}: BTC 1h bias is bear; skipping counter-BTC BUY.", "TRACE")
+            skipped_signals += 1
+            return False
+        if chosen_dir == "SELL" and btc1h_bias == "bull":
+            dbg(f"Skipping {symbol}: BTC 1h bias is bull; skipping counter-BTC SELL.", "TRACE")
+            skipped_signals += 1
+            return False
+
+        # Dual bias flip rule for reversal trades
+        try:
+            higher_tf = "4h" if chosen_tf == "1h" else ("1d" if chosen_tf == "4h" else "1d")
+        except Exception:
+            higher_tf = "4h"
+
+        df_high = get_klines(symbol, higher_tf, limit=120)
+        bias_high = smc_bias(df_high) if df_high is not None and len(df_high) >= 60 else None
+
+        if bias_high is not None:
+            is_reversal = (chosen_dir == "BUY" and bias_high == "bear") or (chosen_dir == "SELL" and bias_high == "bull")
+            if is_reversal:
+                flip_1 = bias_recent_flip(symbol, "1h", "bull" if chosen_dir=="BUY" else "bear", lookback_candles=3)
+                flip_4 = bias_recent_flip(symbol, "4h", "bull" if chosen_dir=="BUY" else "bear", lookback_candles=3)
+                if not (flip_1 and flip_4):
+                    dbg(f"Skipping {symbol}: reversal detected but dual bias flip missing (1h:{flip_1},4h:{flip_4}).", "TRACE")
+                    skipped_signals += 1
+                    return False
 
     # volume consistency on chosen timeframe
     df_chosen = get_klines(symbol, chosen_tf, limit=120)
     if df_chosen is None or len(df_chosen) < 10:
         skipped_signals += 1
         return False
+
     if not volume_ok(df_chosen, required_consecutive=2):
         dbg(f"Skipping {symbol}: volume consistency failed on {chosen_tf}.", "TRACE")
         skipped_signals += 1
