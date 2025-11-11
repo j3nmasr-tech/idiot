@@ -430,24 +430,28 @@ def log_trade_close(trade):
     except Exception as e:
         print("log_trade_close error:", e)
 
-# ===== BTC ADX & DOMINANCE CHECKS (NEW) =====
+# ===== BTC ADX & DOMINANCE CHECKS (WITH CACHE) =====
+import numpy as np
+from collections import Counter
+import time
+import requests
+
+# cache for BTC dominance
+_btc_dom_cache = {"value": None, "timestamp": 0}
+BTC_DOM_CACHE_TTL = 60  # seconds
+
 def compute_adx(df, period=14):
-    # df must have columns high, low, close
     try:
         high = df["high"].values
         low = df["low"].values
         close = df["close"].values
-        length = len(df)
-        if length < period + 2:
+        if len(df) < period + 2:
             return None
-        # True Range
         tr = np.maximum.reduce([high[1:] - low[1:], np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])])
-        # +DM and -DM
         up_move = high[1:] - high[:-1]
         down_move = low[:-1] - low[1:]
         plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
         minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-        # Wilder smoothing
         atr = np.zeros_like(tr)
         atr[0] = np.mean(tr[:period])
         for i in range(1, len(tr)):
@@ -459,11 +463,9 @@ def compute_adx(df, period=14):
         for i in range(1, len(plus_dm)):
             plus_dm_s[i] = (plus_dm_s[i-1] * (period - 1) + plus_dm[i]) / period
             minus_dm_s[i] = (minus_dm_s[i-1] * (period - 1) + minus_dm[i]) / period
-        # DI
         plus_di = 100.0 * (plus_dm_s / atr)
         minus_di = 100.0 * (minus_dm_s / atr)
         dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-9))
-        # ADX = SMA of DX
         adx = np.zeros_like(dx)
         adx[0] = np.mean(dx[:period])
         for i in range(1, len(dx)):
@@ -484,16 +486,30 @@ def btc_adx_4h_ok(min_adx=20, period=14):
     print(f"BTC 4H ADX: {adx:.2f}")
     return adx >= min_adx
 
-def get_btc_dominance():
-    j = safe_get_json(COINGECKO_GLOBAL, {}, timeout=5, retries=1)
-    try:
-        m = j.get("data", {}).get("market_cap_percentage", {})
-        btc_pct = m.get("btc") or m.get("btc_dominance") or None
-        if btc_pct is None:
-            return None
-        return float(btc_pct)
-    except Exception:
-        return None
+def get_btc_dominance(retries=2, wait=2):
+    global _btc_dom_cache
+    now = time.time()
+    # return cached value if not expired
+    if _btc_dom_cache["value"] is not None and (now - _btc_dom_cache["timestamp"]) < BTC_DOM_CACHE_TTL:
+        return _btc_dom_cache["value"]
+    # fetch from API
+    for attempt in range(retries):
+        try:
+            r = requests.get("https://api.coingecko.com/api/v3/global", timeout=5)
+            r.raise_for_status()
+            j = r.json()
+            btc_pct = j.get("data", {}).get("market_cap_percentage", {}).get("btc")
+            if btc_pct is not None:
+                btc_pct = float(btc_pct)
+                _btc_dom_cache = {"value": btc_pct, "timestamp": now}
+                return btc_pct
+        except Exception as e:
+            if attempt < retries - 1:
+                time.sleep(wait)
+            else:
+                print(f"Error fetching BTC dominance: {e}")
+                return None
+    return None
 
 def btc_dominance_ok(max_pct=55.0):
     dom = get_btc_dominance()
@@ -503,13 +519,10 @@ def btc_dominance_ok(max_pct=55.0):
     print(f"BTC Dominance: {dom:.2f}% (max allowed {max_pct}%)")
     return dom <= max_pct
 
-from collections import Counter
-
 def btc_direction_3tf():
-    # require majority of 3 TFs (1H,4H,1D) to agree (BUY or SELL)
     try:
         dirs = []
-        for tf in TIMEFRAMES:  # e.g., ["1h","4h","1d"]
+        for tf in TIMEFRAMES:
             df = get_klines("BTCUSDT", tf, limit=120)
             if df is None or len(df) < 30:
                 print(f"⚠️ Missing BTC klines for {tf} — blocking (ultra-safe).")
@@ -519,27 +532,18 @@ def btc_direction_3tf():
                 print(f"⚠️ Could not determine BTC direction on {tf}.")
                 return None
             dirs.append(d)
-
         counts = Counter(dirs)
         most_common_dir, count = counts.most_common(1)[0]
         print(f"BTC directions: {dirs} -> majority={most_common_dir} ({count}/3)")
-
         if count >= 2:
-            return most_common_dir  # majority agrees
+            return most_common_dir
         else:
-            return None  # block if no majority
+            return None
     except Exception as e:
         print("btc_direction_3tf error:", e)
         return None
 
 def btc_health_check():
-    """
-    Ultra-Safe master filter for BTC:
-      - Majority (2/3) of 1H,4H,1D must agree
-      - 4H ADX >= 20
-      - BTC dominance <= 55%
-    Returns True only when all checks pass.
-    """
     dir_ok = btc_direction_3tf()
     if not dir_ok:
         print("BTC direction not aligned (majority 2/3).")
