@@ -511,7 +511,7 @@ def get_btc_dominance(retries=2, wait=2):
                 return None
     return None
 
-def btc_dominance_ok(max_pct=55.0):
+def btc_dominance_ok(max_pct=65.0):
     dom = get_btc_dominance()
     if dom is None:
         print("⚠️ Could not fetch BTC dominance — blocking (ultra-safe).")
