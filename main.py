@@ -543,17 +543,29 @@ def btc_direction_3tf():
         print("btc_direction_3tf error:", e)
         return None
 
-def btc_health_check():
+def btc_health_check(symbol="BTCUSDT"):
+    """
+    Ultra-Safe master filter for BTC:
+      - Majority (2/3) of 1H,4H,1D must agree
+      - 4H ADX >= 20
+      - BTC dominance <= 55% (skipped for BTC itself)
+    Returns True only when all checks pass.
+    """
     dir_ok = btc_direction_3tf()
     if not dir_ok:
         print("BTC direction not aligned (majority 2/3).")
         return False
+
     if not btc_adx_4h_ok(min_adx=20, period=14):
         print("BTC 4H ADX check failed.")
         return False
-    if not btc_dominance_ok(max_pct=55.0):
-        print("BTC dominance check failed.")
-        return False
+
+    # Skip dominance check if symbol is BTC
+    if not symbol.upper().startswith("BTC"):
+        if not btc_dominance_ok(max_pct=55.0):
+            print("BTC dominance check failed.")
+            return False
+
     return True
 
 # ===== BTC VOLATILITY SPIKE FILTER (ADDED) =====
