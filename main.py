@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
-# Forex + Gold scalp bot — adapted from your crypto scalp logic
-# Free data via yfinance (no API key)
-# Requirements: yfinance, pandas, numpy, requests
+# Forex + Gold scalp bot — adapted from SIRTS v10 scalp logic
+# Uses yfinance for free price data (Forex tickers and GC=F for gold)
+# Environment variables: BOT_TOKEN (Telegram), CHAT_ID
 
 import os
-import time
 import re
-import csv
+import time
 import math
+import traceback
 import requests
-import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
+import numpy as np
+from datetime import datetime
+import csv
 
-# try import yfinance
-try:
-    import yfinance as yf
-except Exception as e:
-    raise RuntimeError("Please install yfinance: pip install yfinance") from e
+# Try import yfinance; if missing, script will crash and Render will show missing dep.
+import yfinance as yf
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -32,7 +30,7 @@ COOLDOWN_TIME_FAIL    = 45 * 60
 VOLATILITY_THRESHOLD_PCT = 2.5
 VOLATILITY_PAUSE = 1800
 CHECK_INTERVAL = 60
-API_CALL_DELAY = 0.1
+API_CALL_DELAY = 0.05
 
 TIMEFRAMES = ["15m", "30m", "1h", "4h"]
 WEIGHT_BIAS   = 0.40
@@ -42,13 +40,14 @@ WEIGHT_VOLUME = 0.15
 
 MIN_TF_SCORE  = 55
 CONF_MIN_TFS  = 2
-CONFIDENCE_MIN = 60.0   # you asked earlier about 55% — change here to 55.0 if you want
-MIN_QUOTE_VOLUME = 0.0  # yfinance volumes can be NaN — treat as okay
-TOP_SYMBOLS = 5         # number of pairs to monitor (default includes gold)
+CONFIDENCE_MIN = 55.0   # <-- set to 55% as requested
+MIN_QUOTE_VOLUME = 1_000_000.0   # unused for many FX pairs but kept for parity
+TOP_SYMBOLS = 12    # number of pairs to scan by default
 
 LOG_CSV = "./sirts_forex_scalp.csv"
 
-BTC_ADX_MIN = 18.0  # reused variable name for ADX threshold (applies to market trend check)
+BTC_ADX_MIN = 18.0  # not used for forex; kept for parity
+
 STRICT_TF_AGREE = False
 MAX_OPEN_TRADES = 20
 MAX_EXPOSURE_PCT = 0.20
@@ -81,11 +80,25 @@ STATS = {
     "by_tf": {tf: {"sent":0,"hit":0,"fail":0,"breakeven":0} for tf in TIMEFRAMES}
 }
 
+# ===== Forex / Gold tickers (Yahoo) =====
+# You can change this list; GC=F is COMEX gold futures (reliable on Yahoo)
+FOREX_TICKERS = [
+    "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","NZDUSD=X",
+    "USDCHF=X","CHFJPY=X","EURJPY=X","EURGBP=X","GBPJPY=X","GC=F"   # GC=F = gold futures
+]
+
+# mapping function (keeps same symbol style used in your messages)
+def sanitize_symbol(symbol: str) -> str:
+    if not symbol or not isinstance(symbol, str):
+        return ""
+    s = re.sub(r"[^A-Z0-9=._-]", "", symbol.upper())
+    return s[:30]
+
 # ===== HELPERS =====
 def send_message(text):
-    """Send to Telegram if configured, otherwise print."""
+    # If telegram configured, send; otherwise print
     if not BOT_TOKEN or not CHAT_ID:
-        print("TELEGRAM OFF:", text)
+        print("TELEGRAM not configured — message:\n", text)
         return False
     try:
         r = requests.post(
@@ -103,72 +116,88 @@ def send_message(text):
         print("❌ Telegram send error:", e)
         return False
 
-def sanitize_symbol(sym: str) -> str:
-    if not sym or not isinstance(sym, str):
-        return ""
-    return re.sub(r"[^A-Z0-9=X._-]", "", sym.upper())[:30]
+def safe_yf_history(ticker, interval="1h", period="30d"):
+    """Wrapper for yf.download / Ticker.history with retry/backoff"""
+    tries = 3
+    for attempt in range(1, tries+1):
+        try:
+            # Use yf.Ticker.history for single-symbol reliability
+            tk = yf.Ticker(ticker)
+            df = tk.history(interval=interval, period=period, auto_adjust=False)
+            if df is None or df.empty:
+                return None
+            # Ensure columns exist
+            if not {"Open","High","Low","Close"}.issubset(set(df.columns)):
+                return None
+            # Some feeds use 'Volume' column
+            return df
+        except Exception as e:
+            print(f"yfinance fetch error {ticker} attempt {attempt}/{tries}: {e}")
+            time.sleep(0.8 * attempt)
+            continue
+    return None
 
-def safe_get_yf(ticker, interval="15m", period_days=10):
-    """
-    Fetch candles using yfinance. Returns DataFrame with columns:
-    ['open','high','low','close','volume'] and index as datetime.
-    interval examples: '15m','30m','60m','240m'
-    """
-    # yfinance interval mapping: use the requested interval directly
-    try:
-        # choose period string based on period_days
-        period_str = f"{max(1, period_days)}d"
-        df = yf.download(ticker, interval=interval, period=period_str, progress=False, threads=False)
-        if df is None or df.empty:
-            return None
-        # yfinance returns columns: Open High Low Close Volume
-        df = df.rename(columns={
-            'Open':'open','High':'high','Low':'low','Close':'close','Volume':'volume'
-        })
-        df = df[['open','high','low','close','volume']].astype(float)
-        # ensure enough rows
-        return df
-    except Exception as e:
-        print(f"yfinance fetch error for {ticker} {interval}: {e}")
-        return None
-
-# ===== TIMEFRAME helpers =====
-# map our tf label -> yfinance intervals & recommended period_days to fetch
+# Map your timeframes to yfinance accepted intervals + sensible period
 TF_TO_YF = {
-    "15m": ("15m", 7),
-    "30m": ("30m", 14),
-    "1h":  ("60m", 30),
-    "4h":  ("240m", 60)
+    "15m": ("15m", "7d"),
+    "30m": ("30m", "14d"),
+    "1h" : ("1h", "30d"),
+    "4h" : ("4h", "90d"),
 }
 
 def get_klines(symbol, interval="15m", limit=200):
-    # interval is our label like '15m'
-    yf_interval, period_days = TF_TO_YF.get(interval, ("15m", 7))
-    df = safe_get_yf(symbol, interval=yf_interval, period_days=period_days)
+    symbol = sanitize_symbol(symbol)
+    if not symbol:
+        return None
+    yf_interval, period = TF_TO_YF.get(interval, ("1h","30d"))
+    df = safe_yf_history(symbol, interval=yf_interval, period=period)
     if df is None:
         return None
-    # limit rows to most recent `limit`
-    if len(df) > limit:
-        df = df.iloc[-limit:]
-    return df
+    # Keep last `limit` rows converted to expected columns: open, high, low, close, volume
+    try:
+        d = df[["Open","High","Low","Close"]].copy()
+        # Volume may be missing for some tickers; if missing, create zero column
+        if "Volume" in df.columns:
+            d["Volume"] = df["Volume"]
+        else:
+            d["Volume"] = 0.0
+        d = d.tail(limit)
+        d = d.reset_index(drop=True)
+        d.columns = ["open","high","low","close","volume"]
+        # Convert to numeric
+        d = d.astype(float)
+        return d
+    except Exception as e:
+        print(f"get_klines parse error {symbol} {interval}: {e}")
+        return None
 
 def get_price(symbol):
-    df = safe_get_yf(symbol, interval="1m", period_days=1)
-    if df is None or df.empty:
+    symbol = sanitize_symbol(symbol)
+    if not symbol:
         return None
-    return float(df["close"].iloc[-1])
+    # fetch last 1m bar using yfinance '1m' if available OR 15m close fallback
+    df = safe_yf_history(symbol, interval="1m", period="1d")
+    if df is not None and not df.empty:
+        try:
+            return float(df["Close"].iloc[-1])
+        except Exception:
+            pass
+    # fallback to 15m
+    df2 = get_klines(symbol, "15m", limit=5)
+    if df2 is not None:
+        return float(df2["close"].iloc[-1])
+    return None
 
-# ===== INDICATORS (kept same as crypto bot) =====
+# ===== INDICATORS =====
 def detect_crt(df):
     if df is None or len(df) < 12:
         return False, False
     last = df.iloc[-1]
-    o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"]); v = float(last["volume"] or 0.0)
+    o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"]); v = float(last["volume"])
     body_series = (df["close"] - df["open"]).abs()
     avg_body = body_series.rolling(8, min_periods=6).mean().iloc[-1]
-    avg_vol  = df["volume"].rolling(8, min_periods=6).mean().iloc[-1] if "volume" in df else np.nan
+    avg_vol  = df["volume"].rolling(8, min_periods=6).mean().iloc[-1]
     if np.isnan(avg_body) or np.isnan(avg_vol):
-        # if volume or body NaN — be conservative: return False, False
         return False, False
     body = abs(c - o)
     wick_up   = h - max(o, c)
@@ -193,14 +222,15 @@ def smc_bias(df):
     return "bull" if e20 > e50 else "bear"
 
 def volume_ok(df):
-    # For yfinance FX, volume can be missing (NaN). Treat NaN as OK.
-    if "volume" not in df:
+    # Forex often has no volume; treat as OK if missing or zeros
+    try:
+        ma = df["volume"].rolling(20, min_periods=8).mean().iloc[-1]
+        if np.isnan(ma) or ma <= 0:
+            return True
+        current = df["volume"].iloc[-1]
+        return current > ma * 1.3
+    except Exception:
         return True
-    ma = df["volume"].rolling(20, min_periods=8).mean().iloc[-1]
-    if np.isnan(ma):
-        return True
-    current = df["volume"].iloc[-1]
-    return current > ma * 1.3
 
 # ===== DOUBLE TIMEFRAME CONFIRMATION =====
 def get_direction_from_ma(df, span=20):
@@ -211,8 +241,8 @@ def get_direction_from_ma(df, span=20):
         return None
 
 def tf_agree(symbol, tf_low, tf_high):
-    df_low = get_klines(symbol, tf_low, limit=100)
-    df_high = get_klines(symbol, tf_high, limit=100)
+    df_low = get_klines(symbol, tf_low, 200)
+    df_high = get_klines(symbol, tf_high, 200)
     if df_low is None or df_high is None or len(df_low) < 30 or len(df_high) < 30:
         return not STRICT_TF_AGREE
     dir_low = get_direction_from_ma(df_low)
@@ -223,7 +253,7 @@ def tf_agree(symbol, tf_low, tf_high):
 
 # ===== ATR & POSITION SIZING =====
 def get_atr(symbol, period=14):
-    df = get_klines(symbol, "1h", limit=period+2)
+    df = get_klines(symbol, "1h", period+2)
     if df is None or len(df) < period+1:
         return None
     h = df["high"].values; l = df["low"].values; c = df["close"].values
@@ -236,18 +266,18 @@ def trade_params(symbol, entry, side, atr_multiplier_sl=1.7, tp_mults=(1.8,2.8,3
     atr = get_atr(symbol)
     if atr is None:
         return None
-    atr = max(min(atr, entry * 0.05 if entry>0 else atr), entry * 0.0001 if entry>0 else atr)
+    atr = max(min(atr, entry * 0.05), entry * 0.0001)
     adj_sl_multiplier = atr_multiplier_sl * (1.0 + (0.5 - conf_multiplier) * 0.5)
     if side == "BUY":
-        sl  = round(entry - atr * adj_sl_multiplier, 8)
-        tp1 = round(entry + atr * tp_mults[0] * conf_multiplier, 8)
-        tp2 = round(entry + atr * tp_mults[1] * conf_multiplier, 8)
-        tp3 = round(entry + atr * tp_mults[2] * conf_multiplier, 8)
+        sl  = round(entry - atr * adj_sl_multiplier, 6)
+        tp1 = round(entry + atr * tp_mults[0] * conf_multiplier, 6)
+        tp2 = round(entry + atr * tp_mults[1] * conf_multiplier, 6)
+        tp3 = round(entry + atr * tp_mults[2] * conf_multiplier, 6)
     else:
-        sl  = round(entry + atr * adj_sl_multiplier, 8)
-        tp1 = round(entry - atr * tp_mults[0] * conf_multiplier, 8)
-        tp2 = round(entry - atr * tp_mults[1] * conf_multiplier, 8)
-        tp3 = round(entry - atr * tp_mults[2] * conf_multiplier, 8)
+        sl  = round(entry + atr * adj_sl_multiplier, 6)
+        tp1 = round(entry - atr * tp_mults[0] * conf_multiplier, 6)
+        tp2 = round(entry - atr * tp_mults[1] * conf_multiplier, 6)
+        tp3 = round(entry - atr * tp_mults[2] * conf_multiplier, 6)
     return sl, tp1, tp2, tp3
 
 def pos_size_units(entry, sl, confidence_pct, btc_risk_multiplier=1.0):
@@ -265,12 +295,12 @@ def pos_size_units(entry, sl, confidence_pct, btc_risk_multiplier=1.0):
     if exposure > max_exposure and exposure > 0:
         units = max_exposure / entry
         exposure = units * entry
-    margin_req = abs(exposure) / LEVERAGE
+    margin_req = exposure / LEVERAGE
     if margin_req < MIN_MARGIN_USD:
         return 0.0, 0.0, 0.0, risk_percent
-    return round(units,8), round(margin_req,6), round(abs(exposure),6), risk_percent
+    return round(units,8), round(margin_req,6), round(exposure,6), risk_percent
 
-# ===== ADX =====
+# ===== ADX computation (used for optional trend filter) =====
 def compute_adx(df, period=14):
     try:
         high = df["high"].values; low = df["low"].values; close = df["close"].values
@@ -295,26 +325,14 @@ def compute_adx(df, period=14):
         print("compute_adx error:", e)
         return None
 
-def market_adx_ok(symbol, min_adx=BTC_ADX_MIN, period=14):
-    df = get_klines(symbol, "4h", limit=period*6+10)
-    if df is None or len(df) < period+10:
-        return None
-    adx = compute_adx(df, period=period)
-    return adx
-
-# ===== SENTIMENT (kept lightweight) =====
-def sentiment_label():
-    # no fear/greed for FX; return neutral
-    return "neutral"
-
-# ===== LOGGING =====
+# ===== LOGGING / CSV =====
 def init_csv():
     if not os.path.exists(LOG_CSV):
         with open(LOG_CSV,"w",newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
                 "timestamp_utc","symbol","side","entry","tp1","tp2","tp3","sl",
-                "tf","units","margin_usd","exposure_usd","risk_pct","confidence_pct","market_adx","status","breakdown"
+                "tf","units","margin_usd","exposure_usd","risk_pct","confidence_pct","status","breakdown"
             ])
 
 def log_signal(row):
@@ -325,27 +343,11 @@ def log_signal(row):
     except Exception as e:
         print("log_signal error:", e)
 
-def log_trade_close(trade):
-    try:
-        with open(LOG_CSV,"a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                datetime.utcnow().isoformat(), trade["s"], trade["side"], trade.get("entry"),
-                trade.get("tp1"), trade.get("tp2"), trade.get("tp3"), trade.get("sl"),
-                trade.get("entry_tf"), trade.get("units"), trade.get("margin"), trade.get("exposure"),
-                trade.get("risk_pct")*100 if trade.get("risk_pct") else None, trade.get("confidence_pct"),
-                trade.get("market_adx"), trade.get("st")
-            ])
-    except Exception as e:
-        print("log_trade_close error:", e)
-
-# ===== SYMBOLS =====
-def get_top_symbols(n=5):
-    # forex tickers on yahoo + gold
-    fixed = ["EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","XAUUSD=X"]  # XAUUSD = gold
-    return fixed[:n]
-
 # ===== ANALYSIS & SIGNAL GENERATION =====
+def get_top_symbols(n=12):
+    # returns first n tickers from FOREX_TICKERS
+    return FOREX_TICKERS[:n]
+
 def current_total_exposure():
     return sum([t.get("exposure", 0) for t in open_trades if t.get("st") == "open"])
 
@@ -368,17 +370,7 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
 
-    # market/trend ADX check (applies to each symbol for FX)
-    market_adx = market_adx_ok(symbol)
-    if market_adx is None:
-        print(f"Skipping {symbol}: market ADX unavailable.")
-        skipped_signals += 1
-        return False
-    if market_adx < BTC_ADX_MIN:
-        print(f"Skipping {symbol}: ADX {market_adx:.2f} < {BTC_ADX_MIN} (trend weak).")
-        skipped_signals += 1
-        return False
-
+    # ===== TF / indicator checks (same logic as your crypto bot) =====
     tf_confirmations = 0
     chosen_dir      = None
     chosen_entry    = None
@@ -460,8 +452,6 @@ def analyze_symbol(symbol):
         return False
     recent_signals[sig] = time.time()
 
-    sentiment = sentiment_label()
-
     entry = get_price(symbol)
     if entry is None:
         skipped_signals += 1
@@ -474,13 +464,10 @@ def analyze_symbol(symbol):
         return False
     sl, tp1, tp2, tp3 = tp_sl
 
+    # For forex sizes, units will be a USD exposure estimate — treat similarly to crypto
     units, margin, exposure, risk_used = pos_size_units(entry, sl, confidence_pct, btc_risk_multiplier=1.0)
 
     if units <= 0 or margin <= 0 or exposure <= 0:
-        skipped_signals += 1
-        return False
-
-    if exposure > CAPITAL * MAX_EXPOSURE_PCT:
         skipped_signals += 1
         return False
 
@@ -489,8 +476,7 @@ def analyze_symbol(symbol):
               f"🎯 TP1:{tp1} TP2:{tp2} TP3:{tp3}\n"
               f"🛑 SL: {sl}\n"
               f"💰 Units:{units} | Margin≈${margin} | Exposure≈${exposure}\n"
-              f"⚠ Risk used: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}% | Sentiment:{sentiment}\n"
-              f"📌 Market ADX: {market_adx:.2f}"
+              f"⚠ Risk used: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}%\n"
              )
 
     send_message(header)
@@ -513,8 +499,7 @@ def analyze_symbol(symbol):
         "tp2_taken": False,
         "tp3_taken": False,
         "placed_at": time.time(),
-        "entry_tf": chosen_tf,
-        "market_adx": market_adx
+        "entry_tf": chosen_tf
     }
     open_trades.append(trade_obj)
     signals_sent_total += 1
@@ -524,12 +509,12 @@ def analyze_symbol(symbol):
     log_signal([
         datetime.utcnow().isoformat(), symbol, chosen_dir, entry,
         tp1, tp2, tp3, sl, chosen_tf, units, margin, exposure,
-        risk_used*100, confidence_pct, market_adx, "open", str(breakdown_per_tf)
+        risk_used*100, confidence_pct, "open", str(breakdown_per_tf)
     ])
     print(f"✅ Signal sent for {symbol} at entry {entry}. Confidence {confidence_pct:.1f}%")
     return True
 
-# ===== TRADE CHECK =====
+# ===== TRADE CHECK (TP/SL/BREAKEVEN) =====
 def check_trades():
     global signals_hit_total, signals_fail_total, signals_breakeven, STATS, last_trade_time, last_trade_result
     for t in list(open_trades):
@@ -539,14 +524,12 @@ def check_trades():
         if p is None:
             continue
         side = t["side"]
-        # BUY
+
         if side == "BUY":
             if not t["tp1_taken"] and p >= t["tp1"]:
                 t["tp1_taken"] = True
                 t["sl"] = t["entry"]
                 send_message(f"🎯 {t['s']} TP1 Hit {p} — SL moved to breakeven.")
-                STATS["by_side"]["BUY"]["hit"] += 1
-                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
@@ -554,8 +537,6 @@ def check_trades():
             if t["tp1_taken"] and not t["tp2_taken"] and p >= t["tp2"]:
                 t["tp2_taken"] = True
                 send_message(f"🎯 {t['s']} TP2 Hit {p}")
-                STATS["by_side"]["BUY"]["hit"] += 1
-                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
@@ -564,40 +545,31 @@ def check_trades():
                 t["tp3_taken"] = True
                 t["st"] = "closed"
                 send_message(f"🏁 {t['s']} TP3 Hit {p} — Trade closed.")
-                STATS["by_side"]["BUY"]["hit"] += 1
-                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
-                log_trade_close(t)
+                log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "closed", "TP3"])
                 continue
             if p <= t["sl"]:
                 if abs(t["sl"] - t["entry"]) < 1e-8:
                     t["st"] = "breakeven"
                     signals_breakeven += 1
-                    STATS["by_side"]["BUY"]["breakeven"] += 1
-                    STATS["by_tf"][t["entry_tf"]]["breakeven"] += 1
                     send_message(f"⚖️ {t['s']} Breakeven SL Hit {p}")
                     last_trade_result[t["s"]] = "breakeven"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
-                    log_trade_close(t)
+                    log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "breakeven", "SL"])
                 else:
                     t["st"] = "fail"
                     signals_fail_total += 1
-                    STATS["by_side"]["BUY"]["fail"] += 1
-                    STATS["by_tf"][t["entry_tf"]]["fail"] += 1
                     send_message(f"❌ {t['s']} SL Hit {p}")
                     last_trade_result[t["s"]] = "loss"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_FAIL
-                    log_trade_close(t)
-        # SELL
-        else:
+                    log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "fail", "SL"])
+        else:  # SELL
             if not t["tp1_taken"] and p <= t["tp1"]:
                 t["tp1_taken"] = True
                 t["sl"] = t["entry"]
                 send_message(f"🎯 {t['s']} TP1 Hit {p} — SL moved to breakeven.")
-                STATS["by_side"]["SELL"]["hit"] += 1
-                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
@@ -605,8 +577,6 @@ def check_trades():
             if t["tp1_taken"] and not t["tp2_taken"] and p <= t["tp2"]:
                 t["tp2_taken"] = True
                 send_message(f"🎯 {t['s']} TP2 Hit {p}")
-                STATS["by_side"]["SELL"]["hit"] += 1
-                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
@@ -615,32 +585,26 @@ def check_trades():
                 t["tp3_taken"] = True
                 t["st"] = "closed"
                 send_message(f"🏁 {t['s']} TP3 Hit {p} — Trade closed.")
-                STATS["by_side"]["SELL"]["hit"] += 1
-                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
-                log_trade_close(t)
+                log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "closed", "TP3"])
                 continue
             if p >= t["sl"]:
                 if abs(t["sl"] - t["entry"]) < 1e-8:
                     t["st"] = "breakeven"
                     signals_breakeven += 1
-                    STATS["by_side"]["SELL"]["breakeven"] += 1
-                    STATS["by_tf"][t["entry_tf"]]["breakeven"] += 1
                     send_message(f"⚖️ {t['s']} Breakeven SL Hit {p}")
                     last_trade_result[t["s"]] = "breakeven"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
-                    log_trade_close(t)
+                    log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "breakeven", "SL"])
                 else:
                     t["st"] = "fail"
                     signals_fail_total += 1
-                    STATS["by_side"]["SELL"]["fail"] += 1
-                    STATS["by_tf"][t["entry_tf"]]["fail"] += 1
                     send_message(f"❌ {t['s']} SL Hit {p}")
                     last_trade_result[t["s"]] = "loss"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_FAIL
-                    log_trade_close(t)
+                    log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "fail", "SL"])
 
     # cleanup closed trades
     for t in list(open_trades):
@@ -663,16 +627,18 @@ def summary():
     acc   = (hits / total * 100) if total > 0 else 0.0
     send_message(f"📊 Daily Summary\nSignals Sent: {total}\nSignals Checked: {total_checked_signals}\nSignals Skipped: {skipped_signals}\n✅ Hits: {hits}\n⚖️ Breakeven: {breakev}\n❌ Fails: {fails}\n🎯 Accuracy: {acc:.1f}%")
     print(f"📊 Daily Summary. Accuracy: {acc:.1f}%")
-    print("Stats by side:", STATS["by_side"])
-    print("Stats by TF:", STATS["by_tf"])
 
 # ===== STARTUP =====
 init_csv()
-send_message("✅ Forex+Gold Scalp Bot deployed — using Yahoo Finance (yfinance).")
-print("✅ Forex+Gold Scalp Bot deployed.")
+print("✅ Forex + Gold scalp bot starting. Confidence min set to", CONFIDENCE_MIN)
+send_message("✅ Forex + Gold scalp bot deployed — Confidence min set to " + str(CONFIDENCE_MIN))
 
-SYMBOLS = get_top_symbols(TOP_SYMBOLS)
-print(f"Monitoring {len(SYMBOLS)} symbols (top {TOP_SYMBOLS}): {SYMBOLS}")
+try:
+    SYMBOLS = get_top_symbols(TOP_SYMBOLS)
+    print(f"Monitoring {len(SYMBOLS)} symbols (Top {TOP_SYMBOLS}).")
+except Exception as e:
+    SYMBOLS = get_top_symbols(12)
+    print("Warning retrieving top symbols, defaulting to fixed list:", SYMBOLS)
 
 # ===== MAIN LOOP =====
 while True:
@@ -681,13 +647,13 @@ while True:
             time.sleep(1)
             continue
 
-        # check for volatility spikes per symbol (basic)
         for i, sym in enumerate(SYMBOLS, start=1):
             print(f"[{i}/{len(SYMBOLS)}] Scanning {sym} …")
             try:
                 analyze_symbol(sym)
             except Exception as e:
                 print(f"⚠️ Error scanning {sym}: {e}")
+                traceback.print_exc()
             time.sleep(API_CALL_DELAY)
 
         check_trades()
@@ -706,4 +672,5 @@ while True:
 
     except Exception as e:
         print("Main loop error:", e)
+        traceback.print_exc()
         time.sleep(5)
