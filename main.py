@@ -901,13 +901,15 @@ while True:
         if now - last_heartbeat > 43200:
             heartbeat()
             last_heartbeat = now
-            
+
         # Daily summary every 24 hours
         if now - last_summary > 86400:
             summary()
             last_summary = now
 
-        print("Cycle completed at", datetime.utcnow().strftime("%H:%M:%S UTC"))
+        from datetime import datetime, timezone
+        print("Cycle completed at", datetime.now(timezone.utc).strftime("%H:%M:%S UTC"))
+        print(f"🕒 Next scan in {CHECK_INTERVAL // 60} minutes...\n")
         time.sleep(CHECK_INTERVAL)
 
     except Exception as e:
