@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
-# Forex + Gold scalp bot — adapted from SIRTS v10 scalp logic
-# Uses yfinance for free price data (Forex tickers and GC=F for gold)
-# Environment variables: BOT_TOKEN (Telegram), CHAT_ID
+# SIRTS v10 — Swing BTC+ETH (OKX Edition)
+# Adapted from your SIRTS v10 scalp logic to swing (1H/4H/1D).
+# Requirements: requests, pandas, numpy
+# Environment variables:
+#   BOT_TOKEN, CHAT_ID
 
 import os
 import re
 import time
-import math
-import traceback
 import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
 import csv
 
-# Try import yfinance; if missing, script will crash and Render will show missing dep.
-import yfinance as yf
+# ===== SYMBOL SANITIZATION =====
+def sanitize_symbol(symbol: str) -> str:
+    if not symbol or not isinstance(symbol, str):
+        return ""
+    s = re.sub(r"[^A-Z0-9_.-]", "", symbol.upper())
+    return s[:20]
 
 # ===== CONFIG =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -27,12 +31,13 @@ COOLDOWN_TIME_DEFAULT = 1800
 COOLDOWN_TIME_SUCCESS = 15 * 60
 COOLDOWN_TIME_FAIL    = 45 * 60
 
+# Swing TFs
+TIMEFRAMES = ["1h", "4h", "1d"]
 VOLATILITY_THRESHOLD_PCT = 2.5
 VOLATILITY_PAUSE = 1800
-CHECK_INTERVAL = 60
-API_CALL_DELAY = 0.05
+CHECK_INTERVAL = 1800            # 30 minutes between full scans
+API_CALL_DELAY = 0.08
 
-TIMEFRAMES = ["15m", "30m", "1h", "4h"]
 WEIGHT_BIAS   = 0.40
 WEIGHT_TURTLE = 0.25
 WEIGHT_CRT    = 0.20
@@ -40,13 +45,25 @@ WEIGHT_VOLUME = 0.15
 
 MIN_TF_SCORE  = 55
 CONF_MIN_TFS  = 2
-CONFIDENCE_MIN = 55.0   # <-- set to 55% as requested
-MIN_QUOTE_VOLUME = 1_000_000.0   # unused for many FX pairs but kept for parity
-TOP_SYMBOLS = 12    # number of pairs to scan by default
+CONFIDENCE_MIN = 55.0
+MIN_QUOTE_VOLUME = 1_000_000.0
 
-LOG_CSV = "./sirts_forex_scalp.csv"
+# Only BTC and ETH
+TOP_SYMBOLS = 2
+MONITORED_SYMBOLS = ["BTCUSDT", "ETHUSDT"]
 
-BTC_ADX_MIN = 18.0  # not used for forex; kept for parity
+OKX_KLINES = "https://www.okx.com/api/v5/market/history-candles"
+OKX_TICKER = "https://www.okx.com/api/v5/market/ticker"
+FNG_API        = "https://api.alternative.me/fng/?limit=1"
+#COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
+
+LOG_CSV = "./sirts_v10_swing_okx.csv"
+
+BTC_DOMINANCE_MAX = 55.0
+BTC_RISK_MULT_BULL  = 1.00
+BTC_RISK_MULT_BEAR  = 0.70
+BTC_RISK_MULT_MIXED = 0.85
+BTC_ADX_MIN = 18.0
 
 STRICT_TF_AGREE = False
 MAX_OPEN_TRADES = 20
@@ -80,25 +97,10 @@ STATS = {
     "by_tf": {tf: {"sent":0,"hit":0,"fail":0,"breakeven":0} for tf in TIMEFRAMES}
 }
 
-# ===== Forex / Gold tickers (Yahoo) =====
-# You can change this list; GC=F is COMEX gold futures (reliable on Yahoo)
-FOREX_TICKERS = [
-    "EURUSD=X","GBPUSD=X","USDJPY=X","AUDUSD=X","USDCAD=X","NZDUSD=X",
-    "USDCHF=X","CHFJPY=X","EURJPY=X","EURGBP=X","GBPJPY=X","GC=F"   # GC=F = gold futures
-]
-
-# mapping function (keeps same symbol style used in your messages)
-def sanitize_symbol(symbol: str) -> str:
-    if not symbol or not isinstance(symbol, str):
-        return ""
-    s = re.sub(r"[^A-Z0-9=._-]", "", symbol.upper())
-    return s[:30]
-
 # ===== HELPERS =====
 def send_message(text):
-    # If telegram configured, send; otherwise print
     if not BOT_TOKEN or not CHAT_ID:
-        print("TELEGRAM not configured — message:\n", text)
+        print("Telegram not configured:", text)
         return False
     try:
         r = requests.post(
@@ -107,162 +109,144 @@ def send_message(text):
             timeout=10
         )
         result = r.json()
+
+        # ✅ Detect silent Telegram rejection
         if not result.get("ok"):
             print("❌ Telegram rejected message:", result)
             return False
+        
         print("✅ Telegram delivered:", text)
         return True
+
     except Exception as e:
         print("❌ Telegram send error:", e)
         return False
 
-def safe_yf_history(ticker, interval="1h", period="30d"):
-    """Wrapper for yf.history with retry/backoff and graceful fallback when an interval is rejected."""
-    tries = 3
-    for attempt in range(1, tries+1):
+def safe_get_json(url, params=None, timeout=8, retries=2):
+    """Fetch JSON with retry/backoff for 429 errors."""
+    for attempt in range(retries + 1):
         try:
-            tk = yf.Ticker(ticker)
-            df = tk.history(interval=interval, period=period, auto_adjust=False)
-            if df is None or df.empty:
-                return None
-            # Ensure expected OHLC columns exist
-            cols = set(df.columns.str.capitalize())
-            # yfinance returns column names like 'Open','High','Low','Close' (capitalized)
-            if not {"Open","High","Low","Close"}.issubset(set(df.columns)):
-                # try to find case-insensitive matches
-                if not {"Open","High","Low","Close"}.issubset(cols):
-                    return None
-            return df
+            r = requests.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                wait = (attempt + 1) * 1.0
+                print(f"429 Too Many Requests, waiting {wait}s before retry…")
+                time.sleep(wait)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.RequestException as e:
+            print(f"⚠️ API request error ({e}) for {url} params={params} attempt={attempt+1}/{retries+1}")
+            if attempt < retries:
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            return None
         except Exception as e:
-            msg = str(e)
-            print(f"yfinance fetch error {ticker} interval={interval} attempt {attempt}/{tries}: {msg}")
-            # If the error mentions invalid interval (like 240m), return special marker to let caller fallback
-            if "interval" in msg and ("240m" in msg or "Invalid input - interval" in msg or "not supported" in msg):
-                # bubble up a clear exception for caller
-                raise ValueError(f"YF_INVALID_INTERVAL: {msg}")
-            time.sleep(0.8 * attempt)
-            continue
-    return None
+            print(f"⚠️ Unexpected error fetching {url}: {e}")
+            return None
 
-# TF -> (yf_interval, default_period)
-# default to use 4h where available; we'll verify at startup and adjust TF_TO_YF_FALLBACK accordingly.
-TF_TO_YF_CANDIDATES = {
-    "15m": ("15m", "7d"),
-    "30m": ("30m", "14d"),
-    "1h" : ("1h", "30d"),
-    "4h" : ("4h", "90d"),  # prefer 4h if supported
-}
+# ===== SYMBOLS =====
+def get_top_symbols(n=2):
+    # We force BTC and ETH only for the swing edition
+    fixed = ["BTCUSDT","ETHUSDT"]
+    return fixed[:n]
 
-# This dict will be the one actually used at runtime; it may be modified to fallback to 1h for "4h".
-TF_TO_YF = TF_TO_YF_CANDIDATES.copy()
+def okx_inst_id(symbol):
+    """
+    Convert symbol like 'BTCUSDT' -> OKX instrument id 'BTC-USDT-SWAP'
+    (OKX uses dash-separated instrument ids for perpetual swap)
+    """
+    s = sanitize_symbol(symbol)
+    if not s or len(s) < 6:
+        return None
+    base = s[:-4]
+    return f"{base}-USDT-SWAP"
 
-def supports_yf_interval(ticker="EURUSD=X", interval="4h", period="30d"):
-    """Try a quick history call to verify if yfinance/Yahoo accepts the interval for this ticker."""
+def get_24h_quote_volume(symbol):
+    symbol = sanitize_symbol(symbol)
+    if not symbol:
+        return 0.0
+    inst = okx_inst_id(symbol)
+    if not inst:
+        return 0.0
+    j = safe_get_json(OKX_TICKER, {"instId": inst}, timeout=8, retries=2)
     try:
-        df = safe_yf_history(ticker, interval=interval, period=period)
-        # if we get a df back, it's supported
-        return df is not None
-    except ValueError as e:
-        # we encountered a yfinance invalid-interval error
-        print("Interval support test failed:", e)
-        return False
-    except Exception as e:
-        # other errors treat as unsupported for safety
-        print("Interval support test other error:", e)
-        return False
+        # OKX ticker returns: {"code":"0","data":[{...}]}
+        lst = j.get("data") or j.get("result") or []
+        if isinstance(lst, list) and lst:
+            item = lst[0]
+            # candidate fields: vol24h, volCcy24h, vol, volCcy24h
+            return float(item.get("volCcy24h") or item.get("vol24h") or item.get("vol") or 0.0)
+        return 0.0
+    except Exception:
+        return 0.0
 
-def adjust_tf_mapping_at_startup():
-    """At startup, detect if '4h' is supported for our environment. If not, fallback 4h -> 1h."""
-    global TF_TO_YF
-    print("Checking Yahoo / yfinance support for 4h interval...")
-    try:
-        ok = supports_yf_interval(ticker="EURUSD=X", interval="4h", period="14d")
-        if ok:
-            print("4h interval appears supported by yfinance/Yahoo in this environment. Using 4h.")
-            TF_TO_YF = TF_TO_YF_CANDIDATES.copy()
-        else:
-            print("4h interval NOT supported — falling back to 1h for the 4h timeframe.")
-            TF_TO_YF = TF_TO_YF_CANDIDATES.copy()
-            TF_TO_YF["4h"] = ("1h", "60d")  # fallback: use hourly data as substitute for 4h
-    except Exception as e:
-        print("Unexpected during TF mapping check:", e)
-        TF_TO_YF = TF_TO_YF_CANDIDATES.copy()
-        TF_TO_YF["4h"] = ("1h", "60d")
-
-adjust_tf_mapping_at_startup()
-
-def get_klines(symbol, interval="15m", limit=200):
+def get_klines(symbol, interval="1h", limit=200):
     symbol = sanitize_symbol(symbol)
     if not symbol:
         return None
-    yf_interval, period = TF_TO_YF.get(interval, ("1h","30d"))
+    inst = okx_inst_id(symbol)
+    if not inst:
+        return None
+    # OKX expects bar like '1m','3m','5m','15m','30m','1H','4H','1D'
+    tf_map = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
+              "1h":"1H","2h":"2H","4h":"4H","1d":"1D"}
+    bar = tf_map.get(interval, "1H")
+    j = safe_get_json(OKX_KLINES, {"instId": inst, "bar": bar, "limit": limit}, timeout=10, retries=2)
     try:
-        df = safe_yf_history(symbol, interval=yf_interval, period=period)
-    except ValueError as iv_err:
-        # invalid interval from yfinance (e.g. complains about 240m); fallback automatically:
-        print(f"safe_yf_history raised invalid interval for {symbol} {yf_interval}: {iv_err}")
-        # fallback mapping: if 4h was requested, use 1h
-        if interval == "4h":
-            yf_interval, period = ("1h", "60d")
-            try:
-                df = safe_yf_history(symbol, interval=yf_interval, period=period)
-            except Exception as e:
-                print(f"Fallback hourly fetch failed for {symbol}: {e}")
-                return None
-        else:
+        rows = j.get("data") if isinstance(j, dict) else None
+        if not rows or not isinstance(rows, list):
             return None
+        # OKX returns each candle as [ts, open, high, low, close, volume]
+        df = pd.DataFrame(rows)
+        # Ensure columns exist
+        if df.shape[1] < 6:
+            return None
+        df = df.iloc[:, 0:6]  # ts, open, high, low, close, volume
+        df.columns = ["timestamp","open","high","low","close","volume"]
+        # Convert timestamp -> numeric, open..volume -> float
+        try:
+            df["open"] = df["open"].astype(float)
+            df["high"] = df["high"].astype(float)
+            df["low"] = df["low"].astype(float)
+            df["close"] = df["close"].astype(float)
+            df["volume"] = df["volume"].astype(float)
+        except Exception:
+            # sometimes OKX returns strings; attempt conversion robustly
+            df["open"] = pd.to_numeric(df["open"], errors="coerce")
+            df["high"] = pd.to_numeric(df["high"], errors="coerce")
+            df["low"] = pd.to_numeric(df["low"], errors="coerce")
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        # drop rows with NaN
+        df = df.dropna().reset_index(drop=True)
+        # keep only OHLCV columns (drop timestamp column for consistency with original code)
+        df = df[["open","high","low","close","volume"]]
+        return df
     except Exception as e:
-        print(f"safe_yf_history error for {symbol} {yf_interval}: {e}")
-        return None
-
-    if df is None:
-        return None
-    # Keep last `limit` rows converted to expected columns: open, high, low, close, volume
-    try:
-        # yfinance returns 'Open','High','Low','Close' (capitalized). keep that style.
-        d = df[["Open","High","Low","Close"]].copy()
-        # Volume may be missing for some tickers; if missing, create zero column
-        if "Volume" in df.columns:
-            d["Volume"] = df["Volume"]
-        else:
-            d["Volume"] = 0.0
-        d = d.tail(limit)
-        d = d.reset_index(drop=True)
-        d.columns = ["open","high","low","close","volume"]
-        # Convert to numeric
-        d = d.astype(float)
-        return d
-    except Exception as e:
-        print(f"get_klines parse error {symbol} {interval}: {e}")
+        print(f"⚠️ get_klines parse error for {symbol} {interval}: {e}")
         return None
 
 def get_price(symbol):
     symbol = sanitize_symbol(symbol)
     if not symbol:
         return None
-    # fetch last 1m bar using yfinance '1m' if available OR 15m close fallback
+    inst = okx_inst_id(symbol)
+    if not inst:
+        return None
+    j = safe_get_json(OKX_TICKER, {"instId": inst}, timeout=6, retries=2)
     try:
-        df = safe_yf_history(symbol, interval="1m", period="1d")
-    except ValueError:
-        df = None
+        lst = j.get("data") if isinstance(j, dict) else None
+        if not lst:
+            return None
+        item = lst[0]
+        # OKX keys: 'last' or 'lastPrice'
+        return float(item.get("last") or item.get("lastPrice") or item.get("px") or 0.0)
     except Exception:
-        df = None
-
-    if df is not None and not df.empty:
-        try:
-            # yfinance may return 'Close' column
-            return float(df["Close"].iloc[-1])
-        except Exception:
-            pass
-    # fallback to 15m
-    df2 = get_klines(symbol, "15m", limit=5)
-    if df2 is not None:
-        return float(df2["close"].iloc[-1])
-    return None
+        return None
 
 # ===== INDICATORS =====
 def detect_crt(df):
-    if df is None or len(df) < 12:
+    if len(df) < 12:
         return False, False
     last = df.iloc[-1]
     o = float(last["open"]); h = float(last["high"]); l = float(last["low"]); c = float(last["close"]); v = float(last["volume"])
@@ -279,7 +263,7 @@ def detect_crt(df):
     return bull, bear
 
 def detect_turtle(df, look=20):
-    if df is None or len(df) < look+2:
+    if len(df) < look+2:
         return False, False
     ph = df["high"].iloc[-look-1:-1].max()
     pl = df["low"].iloc[-look-1:-1].min()
@@ -294,15 +278,11 @@ def smc_bias(df):
     return "bull" if e20 > e50 else "bear"
 
 def volume_ok(df):
-    # Forex often has no volume; treat as OK if missing or zeros
-    try:
-        ma = df["volume"].rolling(20, min_periods=8).mean().iloc[-1]
-        if np.isnan(ma) or ma <= 0:
-            return True
-        current = df["volume"].iloc[-1]
-        return current > ma * 1.3
-    except Exception:
+    ma = df["volume"].rolling(20, min_periods=8).mean().iloc[-1]
+    if np.isnan(ma):
         return True
+    current = df["volume"].iloc[-1]
+    return current > ma * 1.3
 
 # ===== DOUBLE TIMEFRAME CONFIRMATION =====
 def get_direction_from_ma(df, span=20):
@@ -313,8 +293,8 @@ def get_direction_from_ma(df, span=20):
         return None
 
 def tf_agree(symbol, tf_low, tf_high):
-    df_low = get_klines(symbol, tf_low, 200)
-    df_high = get_klines(symbol, tf_high, 200)
+    df_low = get_klines(symbol, tf_low, 100)
+    df_high = get_klines(symbol, tf_high, 100)
     if df_low is None or df_high is None or len(df_low) < 30 or len(df_high) < 30:
         return not STRICT_TF_AGREE
     dir_low = get_direction_from_ma(df_low)
@@ -325,7 +305,7 @@ def tf_agree(symbol, tf_low, tf_high):
 
 # ===== ATR & POSITION SIZING =====
 def get_atr(symbol, period=14):
-    df = get_klines(symbol, "1h", period+2)
+    df = get_klines(symbol, "1h", period+1)
     if df is None or len(df) < period+1:
         return None
     h = df["high"].values; l = df["low"].values; c = df["close"].values
@@ -341,15 +321,15 @@ def trade_params(symbol, entry, side, atr_multiplier_sl=1.7, tp_mults=(1.8,2.8,3
     atr = max(min(atr, entry * 0.05), entry * 0.0001)
     adj_sl_multiplier = atr_multiplier_sl * (1.0 + (0.5 - conf_multiplier) * 0.5)
     if side == "BUY":
-        sl  = round(entry - atr * adj_sl_multiplier, 6)
-        tp1 = round(entry + atr * tp_mults[0] * conf_multiplier, 6)
-        tp2 = round(entry + atr * tp_mults[1] * conf_multiplier, 6)
-        tp3 = round(entry + atr * tp_mults[2] * conf_multiplier, 6)
+        sl  = round(entry - atr * adj_sl_multiplier, 8)
+        tp1 = round(entry + atr * tp_mults[0] * conf_multiplier, 8)
+        tp2 = round(entry + atr * tp_mults[1] * conf_multiplier, 8)
+        tp3 = round(entry + atr * tp_mults[2] * conf_multiplier, 8)
     else:
-        sl  = round(entry + atr * adj_sl_multiplier, 6)
-        tp1 = round(entry - atr * tp_mults[0] * conf_multiplier, 6)
-        tp2 = round(entry - atr * tp_mults[1] * conf_multiplier, 6)
-        tp3 = round(entry - atr * tp_mults[2] * conf_multiplier, 6)
+        sl  = round(entry + atr * adj_sl_multiplier, 8)
+        tp1 = round(entry - atr * tp_mults[0] * conf_multiplier, 8)
+        tp2 = round(entry - atr * tp_mults[1] * conf_multiplier, 8)
+        tp3 = round(entry - atr * tp_mults[2] * conf_multiplier, 8)
     return sl, tp1, tp2, tp3
 
 def pos_size_units(entry, sl, confidence_pct, btc_risk_multiplier=1.0):
@@ -372,7 +352,21 @@ def pos_size_units(entry, sl, confidence_pct, btc_risk_multiplier=1.0):
         return 0.0, 0.0, 0.0, risk_percent
     return round(units,8), round(margin_req,6), round(exposure,6), risk_percent
 
-# ===== ADX computation (used for optional trend filter) =====
+# ===== SENTIMENT =====
+def get_fear_greed_value():
+    j = safe_get_json(FNG_API, {}, timeout=3, retries=1)
+    try:
+        return int(j["data"][0]["value"])
+    except:
+        return 50
+
+def sentiment_label():
+    v = get_fear_greed_value()
+    if v < 25: return "fear"
+    if v > 75: return "greed"
+    return "neutral"
+
+# ===== BTC ADX COMPUTATION =====
 def compute_adx(df, period=14):
     try:
         high = df["high"].values; low = df["low"].values; close = df["close"].values
@@ -397,14 +391,74 @@ def compute_adx(df, period=14):
         print("compute_adx error:", e)
         return None
 
-# ===== LOGGING / CSV =====
+def btc_adx_4h_ok(min_adx=BTC_ADX_MIN, period=14):
+    df = get_klines("BTCUSDT", "4h", limit=period*6+10)
+    if df is None or len(df) < period+10:
+        print("⚠️ BTC 4H klines not available for ADX check.")
+        return None
+    adx = compute_adx(df, period=period)
+    if adx is None: return None
+    print(f"BTC 4H ADX: {adx:.2f}")
+    return float(adx)
+
+# ===== BTC DIRECTION (4H Swing Version) =====
+def btc_direction_4h():
+    try:
+        df4 = get_klines("BTCUSDT", "4h", 120)
+        if df4 is None or len(df4) < 30:
+            return None
+        b4 = smc_bias(df4)
+        return "BULL" if b4 == "bull" else "BEAR"
+    except Exception as e:
+        print("btc_direction_4h error:", e)
+        return None
+
+_last_dom = None
+_last_dom_time = 0
+
+def get_btc_dominance():
+    global _last_dom, _last_dom_time
+
+    # Use cached value for 60 seconds (prevents API spam)
+    if _last_dom is not None and time.time() - _last_dom_time < 60:
+        return _last_dom
+
+    try:
+        r = requests.get(COINGECKO_GLOBAL, timeout=8)
+        data = r.json()
+
+        # CoinGecko format: data -> market_cap_percentage -> btc
+        dom = data.get("data", {}).get("market_cap_percentage", {}).get("btc")
+
+        # If missing or invalid, skip update
+        if dom is None:
+            print("⚠️ BTC dominance missing in CoinGecko response.")
+            return _last_dom
+
+        dom = float(dom)
+        _last_dom = round(dom, 2)
+        _last_dom_time = time.time()
+        return _last_dom
+
+    except Exception as e:
+        print("⚠️ Dominance fetch error (CoinGecko):", e)
+        return _last_dom  # fallback to last known, do NOT break bot
+        
+def btc_volatility_spike():
+    df = get_klines("BTCUSDT", "5m", 3)
+    if df is None or len(df) < 3:
+        return False
+    pct = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0] * 100.0
+    return abs(pct) >= VOLATILITY_THRESHOLD_PCT
+    
+# ===== LOGGING =====
 def init_csv():
     if not os.path.exists(LOG_CSV):
         with open(LOG_CSV,"w",newline="") as f:
             writer = csv.writer(f)
             writer.writerow([
                 "timestamp_utc","symbol","side","entry","tp1","tp2","tp3","sl",
-                "tf","units","margin_usd","exposure_usd","risk_pct","confidence_pct","status","breakdown"
+                "tf","units","margin_usd","exposure_usd","risk_pct","confidence_pct","btc_dir","btc_dom","btc_adx","status","breakdown"
             ])
 
 def log_signal(row):
@@ -415,11 +469,22 @@ def log_signal(row):
     except Exception as e:
         print("log_signal error:", e)
 
-# ===== ANALYSIS & SIGNAL GENERATION =====
-def get_top_symbols(n=12):
-    # returns first n tickers from FOREX_TICKERS
-    return FOREX_TICKERS[:n]
+def log_trade_close(trade):
+    try:
+        with open(LOG_CSV,"a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                datetime.utcnow().isoformat(), trade["s"], trade["side"], trade.get("entry"),
+                trade.get("tp1"), trade.get("tp2"), trade.get("tp3"), trade.get("sl"),
+                trade.get("entry_tf"), trade.get("units"), trade.get("margin"), trade.get("exposure"),
+                trade.get("risk_pct")*100 if trade.get("risk_pct") else None, trade.get("confidence_pct"),
+                trade.get("btc_dir"), trade.get("btc_dom"), trade.get("btc_adx"),
+                trade.get("st"), trade.get("close_breakdown", "")
+            ])
+    except Exception as e:
+        print("log_trade_close error:", e)
 
+# ===== ANALYSIS & SIGNAL GENERATION =====
 def current_total_exposure():
     return sum([t.get("exposure", 0) for t in open_trades if t.get("st") == "open"])
 
@@ -438,11 +503,59 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
 
-    if last_trade_time.get(symbol, 0) > now:
+    vol24 = get_24h_quote_volume(symbol)
+    if vol24 < MIN_QUOTE_VOLUME:
         skipped_signals += 1
         return False
 
-    # ===== TF / indicator checks (same logic as your crypto bot) =====
+    if last_trade_time.get(symbol, 0) > now:
+        print(f"Cooldown active for {symbol}, skipping until {datetime.fromtimestamp(last_trade_time.get(symbol))}")
+        skipped_signals += 1
+        return False
+
+    # ===== BTC MARKET STATE =====
+    btc_dir = btc_direction_1h()       # only 1H direction used
+    btc_dom = get_btc_dominance()
+    btc_adx = btc_adx_4h_ok()          # returns numeric ADX value
+
+    # If BTC direction is unknown → block everything (for safety)
+    if btc_dir is None:
+        print(f"Skipping {symbol}: BTC direction unclear.")
+        skipped_signals += 1
+        return False
+
+    # ===== ADX FILTER (Blocks ALTS only) =====
+    #BTC_ADX_MIN_LOCAL = BTC_ADX_MIN
+    #if symbol != "BTCUSDT":  # allow BTC regardless
+        #if btc_adx is None:
+            #print(f"Skipping {symbol}: BTC ADX unavailable.")
+            #skipped_signals += 1
+            #return False
+        #if btc_adx < BTC_ADX_MIN_LOCAL:
+            #print(f"Skipping {symbol}: BTC ADX {btc_adx:.2f} < {BTC_ADX_MIN_LOCAL} (trend weak → no alt swings).")
+            #skipped_signals += 1
+            #return False
+
+    # ===== DOMINANCE FILTER (Blocks ALTS only) =====
+    #BTC_DOM_MAX = BTC_DOMINANCE_MAX
+    #if symbol not in ["BTCUSDT", "ETHUSDT"]:  # allow BTC & ETH no matter what
+        #if btc_dom is None:
+            #print(f"Skipping {symbol}: BTC dominance unavailable.")
+            #skipped_signals += 1
+            #return False
+        #if btc_dom > BTC_DOM_MAX:
+            #print(f"Skipping {symbol}: BTC dominance {btc_dom:.2f}% > {BTC_DOM_MAX}% (alts suppressed).")
+            #skipped_signals += 1
+            #return False
+
+    # ===== BTC RISK MULTIPLIER BASED ON DIRECTION =====
+    if btc_dir == "BULL":
+        btc_risk_mult = BTC_RISK_MULT_BULL
+    elif btc_dir == "BEAR":
+        btc_risk_mult = BTC_RISK_MULT_BEAR
+    else:
+        btc_risk_mult = BTC_RISK_MULT_MIXED
+        
     tf_confirmations = 0
     chosen_dir      = None
     chosen_entry    = None
@@ -478,7 +591,7 @@ def analyze_symbol(symbol):
             "bull_score": int(bull_score),
             "bear_score": int(bear_score),
             "bias": bias,
-            "vol_ok": bool(vol_ok),
+            "vol_ok": vol_ok,
             "crt_b": bool(crt_b),
             "crt_s": bool(crt_s),
             "ts_b": bool(ts_b),
@@ -502,27 +615,35 @@ def analyze_symbol(symbol):
 
     print(f"Scanning {symbol}: {tf_confirmations}/{len(TIMEFRAMES)} confirmations. Breakdown: {breakdown_per_tf}")
 
+    # require at least CONF_MIN_TFS confirmations
     if not (tf_confirmations >= CONF_MIN_TFS and chosen_dir and chosen_entry is not None):
-        skipped_signals += 1
         return False
 
+    # compute confidence
     confidence_pct = float(np.mean(per_tf_scores)) if per_tf_scores else 100.0
     confidence_pct = max(0.0, min(100.0, confidence_pct))
 
+    # small safety fallback
     if confidence_pct < CONFIDENCE_MIN or tf_confirmations < CONF_MIN_TFS:
         print(f"Skipping {symbol}: safety check failed (conf={confidence_pct:.1f}%, tfs={tf_confirmations}).")
         skipped_signals += 1
         return False
 
+    # global open-trade / exposure limits
     if len([t for t in open_trades if t.get("st") == "open"]) >= MAX_OPEN_TRADES:
+        print(f"Skipping {symbol}: max open trades reached ({MAX_OPEN_TRADES}).")
         skipped_signals += 1
         return False
 
+    # dedupe on signature
     sig = (symbol, chosen_dir, round(chosen_entry, 6))
     if recent_signals.get(sig, 0) + RECENT_SIGNAL_SIGNATURE_EXPIRE > time.time():
+        print(f"Skipping {symbol}: duplicate recent signal {sig}.")
         skipped_signals += 1
         return False
     recent_signals[sig] = time.time()
+
+    sentiment = sentiment_label()
 
     entry = get_price(symbol)
     if entry is None:
@@ -536,10 +657,15 @@ def analyze_symbol(symbol):
         return False
     sl, tp1, tp2, tp3 = tp_sl
 
-    # For forex sizes, units will be a USD exposure estimate — treat similarly to crypto
-    units, margin, exposure, risk_used = pos_size_units(entry, sl, confidence_pct, btc_risk_multiplier=1.0)
+    units, margin, exposure, risk_used = pos_size_units(entry, sl, confidence_pct, btc_risk_multiplier=btc_risk_mult)
 
     if units <= 0 or margin <= 0 or exposure <= 0:
+        print(f"Skipping {symbol}: invalid position sizing (units:{units}, margin:{margin}).")
+        skipped_signals += 1
+        return False
+
+    if exposure > CAPITAL * MAX_EXPOSURE_PCT:
+        print(f"Skipping {symbol}: exposure {exposure} > {MAX_EXPOSURE_PCT*100:.0f}% of capital.")
         skipped_signals += 1
         return False
 
@@ -548,7 +674,9 @@ def analyze_symbol(symbol):
               f"🎯 TP1:{tp1} TP2:{tp2} TP3:{tp3}\n"
               f"🛑 SL: {sl}\n"
               f"💰 Units:{units} | Margin≈${margin} | Exposure≈${exposure}\n"
-              f"⚠ Risk used: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}%\n"
+              f"⚠ Risk used: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}% | Sentiment:{sentiment}\n"
+              f"📌 BTC: {btc_dir} | ADX(4H): {btc_adx:.2f} | Dominance: {btc_dom:.2f}%" if btc_dom is not None else
+              f"📌 BTC: {btc_dir} | ADX(4H): {btc_adx:.2f} | Dominance: unknown"
              )
 
     send_message(header)
@@ -571,7 +699,10 @@ def analyze_symbol(symbol):
         "tp2_taken": False,
         "tp3_taken": False,
         "placed_at": time.time(),
-        "entry_tf": chosen_tf
+        "entry_tf": chosen_tf,
+        "btc_dir": btc_dir,
+        "btc_dom": btc_dom,
+        "btc_adx": btc_adx
     }
     open_trades.append(trade_obj)
     signals_sent_total += 1
@@ -581,7 +712,7 @@ def analyze_symbol(symbol):
     log_signal([
         datetime.utcnow().isoformat(), symbol, chosen_dir, entry,
         tp1, tp2, tp3, sl, chosen_tf, units, margin, exposure,
-        risk_used*100, confidence_pct, "open", str(breakdown_per_tf)
+        risk_used*100, confidence_pct, btc_dir, btc_dom, btc_adx, "open", str(breakdown_per_tf)
     ])
     print(f"✅ Signal sent for {symbol} at entry {entry}. Confidence {confidence_pct:.1f}%")
     return True
@@ -602,6 +733,8 @@ def check_trades():
                 t["tp1_taken"] = True
                 t["sl"] = t["entry"]
                 send_message(f"🎯 {t['s']} TP1 Hit {p} — SL moved to breakeven.")
+                STATS["by_side"]["BUY"]["hit"] += 1
+                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
@@ -609,6 +742,8 @@ def check_trades():
             if t["tp1_taken"] and not t["tp2_taken"] and p >= t["tp2"]:
                 t["tp2_taken"] = True
                 send_message(f"🎯 {t['s']} TP2 Hit {p}")
+                STATS["by_side"]["BUY"]["hit"] += 1
+                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
@@ -617,31 +752,39 @@ def check_trades():
                 t["tp3_taken"] = True
                 t["st"] = "closed"
                 send_message(f"🏁 {t['s']} TP3 Hit {p} — Trade closed.")
+                STATS["by_side"]["BUY"]["hit"] += 1
+                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
-                log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "closed", "TP3"])
+                log_trade_close(t)
                 continue
             if p <= t["sl"]:
                 if abs(t["sl"] - t["entry"]) < 1e-8:
                     t["st"] = "breakeven"
                     signals_breakeven += 1
+                    STATS["by_side"]["BUY"]["breakeven"] += 1
+                    STATS["by_tf"][t["entry_tf"]]["breakeven"] += 1
                     send_message(f"⚖️ {t['s']} Breakeven SL Hit {p}")
                     last_trade_result[t["s"]] = "breakeven"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
-                    log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "breakeven", "SL"])
+                    log_trade_close(t)
                 else:
                     t["st"] = "fail"
                     signals_fail_total += 1
+                    STATS["by_side"]["BUY"]["fail"] += 1
+                    STATS["by_tf"][t["entry_tf"]]["fail"] += 1
                     send_message(f"❌ {t['s']} SL Hit {p}")
                     last_trade_result[t["s"]] = "loss"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_FAIL
-                    log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "fail", "SL"])
+                    log_trade_close(t)
         else:  # SELL
             if not t["tp1_taken"] and p <= t["tp1"]:
                 t["tp1_taken"] = True
                 t["sl"] = t["entry"]
                 send_message(f"🎯 {t['s']} TP1 Hit {p} — SL moved to breakeven.")
+                STATS["by_side"]["SELL"]["hit"] += 1
+                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
@@ -649,6 +792,8 @@ def check_trades():
             if t["tp1_taken"] and not t["tp2_taken"] and p <= t["tp2"]:
                 t["tp2_taken"] = True
                 send_message(f"🎯 {t['s']} TP2 Hit {p}")
+                STATS["by_side"]["SELL"]["hit"] += 1
+                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
@@ -657,26 +802,32 @@ def check_trades():
                 t["tp3_taken"] = True
                 t["st"] = "closed"
                 send_message(f"🏁 {t['s']} TP3 Hit {p} — Trade closed.")
+                STATS["by_side"]["SELL"]["hit"] += 1
+                STATS["by_tf"][t["entry_tf"]]["hit"] += 1
                 signals_hit_total += 1
                 last_trade_result[t["s"]] = "win"
                 last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
-                log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "closed", "TP3"])
+                log_trade_close(t)
                 continue
             if p >= t["sl"]:
                 if abs(t["sl"] - t["entry"]) < 1e-8:
                     t["st"] = "breakeven"
                     signals_breakeven += 1
+                    STATS["by_side"]["SELL"]["breakeven"] += 1
+                    STATS["by_tf"][t["entry_tf"]]["breakeven"] += 1
                     send_message(f"⚖️ {t['s']} Breakeven SL Hit {p}")
                     last_trade_result[t["s"]] = "breakeven"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_SUCCESS
-                    log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "breakeven", "SL"])
+                    log_trade_close(t)
                 else:
                     t["st"] = "fail"
                     signals_fail_total += 1
+                    STATS["by_side"]["SELL"]["fail"] += 1
+                    STATS["by_tf"][t["entry_tf"]]["fail"] += 1
                     send_message(f"❌ {t['s']} SL Hit {p}")
                     last_trade_result[t["s"]] = "loss"
                     last_trade_time[t["s"]] = time.time() + COOLDOWN_TIME_FAIL
-                    log_signal([datetime.utcnow().isoformat(), t["s"], t["side"], t.get("entry"), t.get("tp1"), t.get("tp2"), t.get("tp3"), t.get("sl"), t.get("entry_tf"), t.get("units"), t.get("margin"), t.get("exposure"), t.get("risk_pct")*100, t.get("confidence_pct"), "fail", "SL"])
+                    log_trade_close(t)
 
     # cleanup closed trades
     for t in list(open_trades):
@@ -699,42 +850,58 @@ def summary():
     acc   = (hits / total * 100) if total > 0 else 0.0
     send_message(f"📊 Daily Summary\nSignals Sent: {total}\nSignals Checked: {total_checked_signals}\nSignals Skipped: {skipped_signals}\n✅ Hits: {hits}\n⚖️ Breakeven: {breakev}\n❌ Fails: {fails}\n🎯 Accuracy: {acc:.1f}%")
     print(f"📊 Daily Summary. Accuracy: {acc:.1f}%")
+    print("Stats by side:", STATS["by_side"])
+    print("Stats by TF:", STATS["by_tf"])
 
 # ===== STARTUP =====
 init_csv()
-print("✅ Forex + Gold scalp bot starting. Confidence min set to", CONFIDENCE_MIN)
-send_message("✅ Forex + Gold scalp bot deployed — Confidence min set to " + str(CONFIDENCE_MIN))
+send_message("✅ SIRTS v10 Swing BTC+ETH (OKX) deployed — Swing defaults active.")
+print("✅ SIRTS v10 Swing deployed.")
 
 try:
     SYMBOLS = get_top_symbols(TOP_SYMBOLS)
-    print(f"Monitoring {len(SYMBOLS)} symbols (Top {TOP_SYMBOLS}).")
+    print(f"Monitoring {len(SYMBOLS)} symbols (BTC & ETH).")
 except Exception as e:
-    SYMBOLS = get_top_symbols(12)
-    print("Warning retrieving top symbols, defaulting to fixed list:", SYMBOLS)
+    SYMBOLS = get_top_symbols(2)
+    print("Warning retrieving top symbols, defaulting to BTC & ETH.")
 
 # ===== MAIN LOOP =====
 while True:
     try:
+        # Skip during BTC volatility pause
         if time.time() < volatility_pause_until:
             time.sleep(1)
             continue
 
+        # BTC volatility spike check
+        try:
+            if btc_volatility_spike():
+                volatility_pause_until = time.time() + VOLATILITY_PAUSE
+                send_message(f"⚠️ BTC volatility spike detected — pausing signals for {VOLATILITY_PAUSE//60} minutes.")
+                print(f"⚠️ BTC volatility spike – pausing until {datetime.fromtimestamp(volatility_pause_until)}")
+                continue
+        except Exception as e:
+            print("Volatility check error:", e)
+
+        # Scan monitored symbols
         for i, sym in enumerate(SYMBOLS, start=1):
             print(f"[{i}/{len(SYMBOLS)}] Scanning {sym} …")
             try:
                 analyze_symbol(sym)
             except Exception as e:
                 print(f"⚠️ Error scanning {sym}: {e}")
-                traceback.print_exc()
             time.sleep(API_CALL_DELAY)
 
+        # Check open trades for TP/SL/Breakeven
         check_trades()
 
+        # Heartbeat every 12 hours
         now = time.time()
         if now - last_heartbeat > 43200:
             heartbeat()
             last_heartbeat = now
 
+        # Daily summary every 24 hours
         if now - last_summary > 86400:
             summary()
             last_summary = now
@@ -744,5 +911,4 @@ while True:
 
     except Exception as e:
         print("Main loop error:", e)
-        traceback.print_exc()
         time.sleep(5)
