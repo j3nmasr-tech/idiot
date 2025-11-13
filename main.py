@@ -515,7 +515,7 @@ def analyze_symbol(symbol):
         return False
 
     # ===== BTC MARKET STATE =====
-    btc_dir = btc_direction_1h()       # only 1H direction used
+    btc_dir = btc_direction_4h()       # only 1H direction used
     btc_dom = get_btc_dominance()
     btc_adx = btc_adx_4h_ok()          # returns numeric ADX value
 
