@@ -35,7 +35,7 @@ COOLDOWN_TIME_FAIL    = 45 * 60
 TIMEFRAMES = ["1h", "4h", "1d"]
 VOLATILITY_THRESHOLD_PCT = 2.5
 VOLATILITY_PAUSE = 1800
-CHECK_INTERVAL = 1800            # 30 minutes between full scans
+CHECK_INTERVAL = 900   # 15 minutes between full scans
 API_CALL_DELAY = 0.08
 
 WEIGHT_BIAS   = 0.40
