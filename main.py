@@ -13,6 +13,7 @@ import numpy as np
 from datetime import datetime
 import csv
 import threading
+import random
 
 # Force line-buffered stdout so prints appear in deployment logs immediately
 try:
@@ -38,7 +39,7 @@ TIMEFRAMES = ["1h", "4h", "1d"]
 VOLATILITY_THRESHOLD_PCT = 2.5
 VOLATILITY_PAUSE = 1800
 CHECK_INTERVAL = 900   # seconds between full scans
-API_CALL_DELAY = 0.08  # small delay between calls to avoid rate limits
+API_CALL_DELAY = 0.1  # small delay between calls to avoid rate limits
 
 # Weights
 WEIGHT_BIAS   = 0.40
@@ -186,35 +187,45 @@ def get_24h_quote_volume(symbol):
     """Return 24h quote volume (cumulative in quote currency) or 0.0 on error."""
     inst = okx_inst_id(symbol)
     if not inst:
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return 0.0
     j = safe_get_json(OKX_TICKER, params={"instId": inst}, timeout=8, retries=2)
     if not j:
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return 0.0
     lst = j.get("data") or j.get("result") or []
     if isinstance(lst, list) and lst:
         item = lst[0]
         try:
-            return float(item.get("volCcy24h") or item.get("vol24h") or item.get("vol") or 0.0)
+            vol = float(item.get("volCcy24h") or item.get("vol24h") or item.get("vol") or 0.0)
+            time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
+            return vol
         except Exception:
+            time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
             return 0.0
+    time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
     return 0.0
 
 def get_klines(symbol, interval="1h", limit=200):
     """Return pandas DataFrame of OHLCV or None. Non-blocking, uses safe_get_json."""
     inst = okx_inst_id(symbol)
     if not inst:
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return None
     tf_map = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m","1h":"1H","2h":"2H","4h":"4H","1d":"1D"}
     bar = tf_map.get(interval, "1H")
     j = safe_get_json(OKX_KLINES, params={"instId": inst, "bar": bar, "limit": limit}, timeout=10, retries=2)
     if not j:
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return None
     rows = j.get("data") if isinstance(j, dict) else None
     if not rows or not isinstance(rows, list):
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return None
     try:
         df = pd.DataFrame(rows)
         if df.shape[1] < 6:
+            time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
             return None
         df = df.iloc[:, 0:6]
         df.columns = ["timestamp", "open", "high", "low", "close", "volume"]
@@ -222,27 +233,36 @@ def get_klines(symbol, interval="1h", limit=200):
         for c in ["open","high","low","close","volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna().reset_index(drop=True)
+        # small pause to avoid burst traffic
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         # Return OHLCV only
         return df[["open","high","low","close","volume"]]
     except Exception as e:
         print(f"⚠️ get_klines parse error {symbol} {interval}: {e}")
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return None
 
 def get_price(symbol):
     """Return last price as float, or None."""
     inst = okx_inst_id(symbol)
     if not inst:
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return None
     j = safe_get_json(OKX_TICKER, params={"instId": inst}, timeout=6, retries=2)
     if not j:
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return None
     lst = j.get("data") if isinstance(j, dict) else None
     if not lst:
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return None
     try:
         item = lst[0]
-        return float(item.get("last") or item.get("lastPrice") or item.get("px") or 0.0)
+        price = float(item.get("last") or item.get("lastPrice") or item.get("px") or 0.0)
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
+        return price
     except Exception:
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return None
 
 # ===== COINGECKO dominance & Alternative.me FNG (safe) =====
@@ -996,12 +1016,13 @@ while True:
 
         # Scan monitored symbols
         for i, sym in enumerate(MONITORED_SYMBOLS, start=1):
-            print(f"[{i}/{len(MONITORED_SYMBOLS)}] Scanning {sym} …")
-            try:
-                analyze_symbol(sym)
-            except Exception as e:
-                print(f"⚠️ Error scanning {sym}: {e}")
-            time.sleep(API_CALL_DELAY)
+    print(f"[{i}/{len(MONITORED_SYMBOLS)}] Scanning {sym} …")
+    try:
+        analyze_symbol(sym)
+    except Exception as e:
+        print(f"⚠️ Error scanning {sym}: {e}")
+    # Small pause between symbols to avoid hitting APIs too fast (helps if 2 bots run together)
+    time.sleep(2.0 + random.uniform(0, 0.6))  # 2.0–2.6 seconds pause
 
         # Check open trades for TP/SL/Breakeven
         check_trades()
