@@ -117,44 +117,109 @@ def send_message(text):
         return False
 
 def safe_yf_history(ticker, interval="1h", period="30d"):
-    """Wrapper for yf.download / Ticker.history with retry/backoff"""
+    """Wrapper for yf.history with retry/backoff and graceful fallback when an interval is rejected."""
     tries = 3
     for attempt in range(1, tries+1):
         try:
-            # Use yf.Ticker.history for single-symbol reliability
             tk = yf.Ticker(ticker)
             df = tk.history(interval=interval, period=period, auto_adjust=False)
             if df is None or df.empty:
                 return None
-            # Ensure columns exist
+            # Ensure expected OHLC columns exist
+            cols = set(df.columns.str.capitalize())
+            # yfinance returns column names like 'Open','High','Low','Close' (capitalized)
             if not {"Open","High","Low","Close"}.issubset(set(df.columns)):
-                return None
-            # Some feeds use 'Volume' column
+                # try to find case-insensitive matches
+                if not {"Open","High","Low","Close"}.issubset(cols):
+                    return None
             return df
         except Exception as e:
-            print(f"yfinance fetch error {ticker} attempt {attempt}/{tries}: {e}")
+            msg = str(e)
+            print(f"yfinance fetch error {ticker} interval={interval} attempt {attempt}/{tries}: {msg}")
+            # If the error mentions invalid interval (like 240m), return special marker to let caller fallback
+            if "interval" in msg and ("240m" in msg or "Invalid input - interval" in msg or "not supported" in msg):
+                # bubble up a clear exception for caller
+                raise ValueError(f"YF_INVALID_INTERVAL: {msg}")
             time.sleep(0.8 * attempt)
             continue
     return None
 
-# Map your timeframes to yfinance accepted intervals + sensible period
-TF_TO_YF = {
+# TF -> (yf_interval, default_period)
+# default to use 4h where available; we'll verify at startup and adjust TF_TO_YF_FALLBACK accordingly.
+TF_TO_YF_CANDIDATES = {
     "15m": ("15m", "7d"),
     "30m": ("30m", "14d"),
     "1h" : ("1h", "30d"),
-    "4h" : ("4h", "90d"),
+    "4h" : ("4h", "90d"),  # prefer 4h if supported
 }
+
+# This dict will be the one actually used at runtime; it may be modified to fallback to 1h for "4h".
+TF_TO_YF = TF_TO_YF_CANDIDATES.copy()
+
+def supports_yf_interval(ticker="EURUSD=X", interval="4h", period="30d"):
+    """Try a quick history call to verify if yfinance/Yahoo accepts the interval for this ticker."""
+    try:
+        df = safe_yf_history(ticker, interval=interval, period=period)
+        # if we get a df back, it's supported
+        return df is not None
+    except ValueError as e:
+        # we encountered a yfinance invalid-interval error
+        print("Interval support test failed:", e)
+        return False
+    except Exception as e:
+        # other errors treat as unsupported for safety
+        print("Interval support test other error:", e)
+        return False
+
+def adjust_tf_mapping_at_startup():
+    """At startup, detect if '4h' is supported for our environment. If not, fallback 4h -> 1h."""
+    global TF_TO_YF
+    print("Checking Yahoo / yfinance support for 4h interval...")
+    try:
+        ok = supports_yf_interval(ticker="EURUSD=X", interval="4h", period="14d")
+        if ok:
+            print("4h interval appears supported by yfinance/Yahoo in this environment. Using 4h.")
+            TF_TO_YF = TF_TO_YF_CANDIDATES.copy()
+        else:
+            print("4h interval NOT supported — falling back to 1h for the 4h timeframe.")
+            TF_TO_YF = TF_TO_YF_CANDIDATES.copy()
+            TF_TO_YF["4h"] = ("1h", "60d")  # fallback: use hourly data as substitute for 4h
+    except Exception as e:
+        print("Unexpected during TF mapping check:", e)
+        TF_TO_YF = TF_TO_YF_CANDIDATES.copy()
+        TF_TO_YF["4h"] = ("1h", "60d")
+
+adjust_tf_mapping_at_startup()
 
 def get_klines(symbol, interval="15m", limit=200):
     symbol = sanitize_symbol(symbol)
     if not symbol:
         return None
     yf_interval, period = TF_TO_YF.get(interval, ("1h","30d"))
-    df = safe_yf_history(symbol, interval=yf_interval, period=period)
+    try:
+        df = safe_yf_history(symbol, interval=yf_interval, period=period)
+    except ValueError as iv_err:
+        # invalid interval from yfinance (e.g. complains about 240m); fallback automatically:
+        print(f"safe_yf_history raised invalid interval for {symbol} {yf_interval}: {iv_err}")
+        # fallback mapping: if 4h was requested, use 1h
+        if interval == "4h":
+            yf_interval, period = ("1h", "60d")
+            try:
+                df = safe_yf_history(symbol, interval=yf_interval, period=period)
+            except Exception as e:
+                print(f"Fallback hourly fetch failed for {symbol}: {e}")
+                return None
+        else:
+            return None
+    except Exception as e:
+        print(f"safe_yf_history error for {symbol} {yf_interval}: {e}")
+        return None
+
     if df is None:
         return None
     # Keep last `limit` rows converted to expected columns: open, high, low, close, volume
     try:
+        # yfinance returns 'Open','High','Low','Close' (capitalized). keep that style.
         d = df[["Open","High","Low","Close"]].copy()
         # Volume may be missing for some tickers; if missing, create zero column
         if "Volume" in df.columns:
@@ -176,9 +241,16 @@ def get_price(symbol):
     if not symbol:
         return None
     # fetch last 1m bar using yfinance '1m' if available OR 15m close fallback
-    df = safe_yf_history(symbol, interval="1m", period="1d")
+    try:
+        df = safe_yf_history(symbol, interval="1m", period="1d")
+    except ValueError:
+        df = None
+    except Exception:
+        df = None
+
     if df is not None and not df.empty:
         try:
+            # yfinance may return 'Close' column
             return float(df["Close"].iloc[-1])
         except Exception:
             pass
