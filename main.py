@@ -184,27 +184,37 @@ def okx_inst_id(symbol: str):
 
 # ===== OKX market calls (safe) =====
 def get_24h_quote_volume(symbol):
-    """Return 24h quote volume (cumulative in quote currency) or 0.0 on error."""
+    """Return 24h quote volume (quote currency only)."""
     inst = okx_inst_id(symbol)
     if not inst:
         time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return 0.0
+
     j = safe_get_json(OKX_TICKER, params={"instId": inst}, timeout=8, retries=2)
     if not j:
         time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
         return 0.0
+
     lst = j.get("data") or j.get("result") or []
-    if isinstance(lst, list) and lst:
-        item = lst[0]
-        try:
-            vol = float(item.get("volCcy24h") or item.get("vol24h") or item.get("vol") or 0.0)
-            time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
-            return vol
-        except Exception:
-            time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
-            return 0.0
+    if not lst or not isinstance(lst, list):
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
+        return 0.0
+
+    item = lst[0]
+
+    # Only use volCcy24h — never vol24h or vol
+    vol = item.get("volCcy24h")
+    if vol is None:
+        time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
+        return 0.0
+
+    try:
+        vol = float(vol)
+    except:
+        vol = 0.0
+
     time.sleep(API_CALL_DELAY + random.uniform(0, 0.05))
-    return 0.0
+    return vol
 
 def get_klines(symbol, interval="1h", limit=200):
     """Return pandas DataFrame of OHLCV or None. Non-blocking, uses safe_get_json."""
