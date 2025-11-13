@@ -583,18 +583,24 @@ def analyze_symbol(symbol):
     if not symbol or not isinstance(symbol, str):
         skipped_signals += 1
         return False
+
     if symbol in SYMBOL_BLACKLIST:
         skipped_signals += 1
         return False
 
-    # volume filter (OKX quote volume)
+    # ===== volume filter (OKX quote volume) =====
     vol24 = get_24h_quote_volume(symbol)
-    if vol24 < MIN_QUOTE_VOLUME:
-        print(f"Skipping {symbol}: low quote volume {vol24}")
-        skipped_signals += 1
-        return False
 
-    # cooldown per symbol
+    # BTC & ETH bypass volume requirement completely
+    if symbol in ["BTCUSDT", "ETHUSDT"]:
+        print(f"Bypassing volume filter for {symbol}: vol24={vol24}")
+    else:
+        if vol24 < MIN_QUOTE_VOLUME:
+            print(f"Skipping {symbol}: low quote volume {vol24}")
+            skipped_signals += 1
+            return False
+
+    # ===== cooldown per symbol (ALWAYS applies to BTC, ETH, and ALTS) =====
     if last_trade_time.get(symbol, 0) > now:
         print(f"Cooldown active for {symbol}, skipping until {datetime.fromtimestamp(last_trade_time.get(symbol))}")
         skipped_signals += 1
