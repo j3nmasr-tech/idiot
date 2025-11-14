@@ -50,62 +50,15 @@ CONFIDENCE_MIN = 60.0
 MIN_QUOTE_VOLUME = 5_000_000
 
 # ============================================================
-# ✅ GET TOP SYMBOLS BY 24H QUOTE VOLUME (OKX) — TOP-TIER ONLY
-# ============================================================
-def get_top_symbols_by_volume(limit=30, min_volume=20_000_000):
-    """
-    Return top-N USDT SWAP symbols sorted by 24h quote volume.
-    Filters out low-cap / meme coins (requires 20M+ quote volume).
-    """
-    url = "https://www.okx.com/api/v5/market/tickers?instType=SWAP"
-
-    try:
-        r = requests.get(url, timeout=5)
-        data = r.json()
-
-        if data.get("code") != "0":
-            print("⚠️ OKX tickers error:", data)
-            return []
-
-        tickers = data.get("data", [])
-        usdt_perps = []
-
-        for t in tickers:
-            inst = t.get("instId", "")
-            if not inst.endswith("-USDT-SWAP"):
-                continue
-
-            vol = float(t.get("volCcy24h", 0))
-
-            # 🔥 FILTER: 20M+ volume = top-tier assets only
-            if vol < min_volume:
-                continue
-
-            symbol = inst.replace("-USDT-SWAP", "USDT")
-            usdt_perps.append((symbol, vol))
-
-        # sort by volume descending
-        usdt_perps.sort(key=lambda x: x[1], reverse=True)
-
-        return [s for s, _ in usdt_perps[:limit]]
-
-    except Exception as e:
-        print("⚠️ get_top_symbols_by_volume error:", e)
-        return []
-
-# ============================================================
-# ⭐ FIXED: STRICT TOP-TIER WHITELIST (no meme coins ever)
+# ⭐ FIXED: SWING BOT SCANS ONLY BTC, ETH, SOL
 # ============================================================
 
-CORE_SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
-    "DOGEUSDT", "TONUSDT", "ADAUSDT", "AVAXUSDT", "DOTUSDT",
-    "LINKUSDT", "TRXUSDT", "MATICUSDT", "NEARUSDT", "ATOMUSDT",
-    "LTCUSDT", "ICPUSDT", "APTUSDT", "SUIUSDT", "INJUSDT",
-    "OPUSDT", "ARBUSDT", "AAVEUSDT", "UNIUSDT", "FTMUSDT",
-    "RNDRUSDT", "EGLDUSDT", "ETCUSDT", "KASUSDT", "JUPUSDT"
-]
+def get_top_symbols_by_volume(limit=None, min_volume=None):
+    # We override the function so nothing else is used
+    return ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 
+# Hard-coded core list (not used anymore, but kept clean)
+CORE_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
 # No more volume-based filtering — whitelist only
 MONITORED_SYMBOLS = CORE_SYMBOLS.copy()
 
@@ -1132,12 +1085,14 @@ except Exception:
 
 # ===== STARTUP =====
 print("🔧 SIRTS v10 Swing — starting main loop")
-send_message("✅ SIRTS v10 Swing BTC+ETH (OKX) deployed — Swing defaults active.")
-print("✅ SIRTS v10 Swing deployed.")
 
-# Optionally ensure MONITORED_SYMBOLS is set correctly
-if not MONITORED_SYMBOLS:
-    MONITORED_SYMBOLS = TOP_SYMBOLS.copy()
+send_message("✅ SIRTS v10 Swing deployed — scanning BTC, ETH, SOL only.")
+print("✅ SIRTS v10 Swing deployed — scanning BTC, ETH, SOL only.")
+
+# Hard-coded symbol list (no top-volume logic, no whitelist logic)
+MONITORED_SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
+
+print("Monitoring BTC, ETH, SOL only.")
 
 # ===== MAIN LOOP =====
 while True:
