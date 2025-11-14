@@ -642,74 +642,92 @@ def analyze_symbol(symbol):
     else:
         btc_risk_mult = BTC_RISK_MULT_MIXED
 
-    # ===== Per-TF analysis =====
-    tf_confirmations = 0
-    chosen_dir      = None
-    chosen_entry    = None
-    chosen_tf       = None
-    breakdown_per_tf = {}
-    per_tf_scores = []
+# ===== STRICT MULTI-TF AGREEMENT (Swing Mode) =====
+tf_confirmations = 0
+chosen_dir      = None
+chosen_entry    = None
+chosen_tf       = None
+breakdown_per_tf = {}
+per_tf_scores = []
 
-    for tf in TIMEFRAMES:
-        df = get_klines(symbol, tf)
-        if df is None or len(df) < 60:
-            breakdown_per_tf[tf] = None
-            print(f"  {tf}: insufficient data")
-            continue
+# get all klines first so we can compare directions
+tf_data = {}
+for tf in TIMEFRAMES:
+    df = get_klines(symbol, tf)
+    if df is None or len(df) < 60:
+        tf_data[tf] = None
+    else:
+        tf_data[tf] = df
 
-        # if low tf requires higher tf confirmation
-        tf_index = TIMEFRAMES.index(tf)
-        if tf_index < len(TIMEFRAMES) - 1:
-            higher_tf = TIMEFRAMES[tf_index + 1]
-            if not tf_agree(symbol, tf, higher_tf):
-                breakdown_per_tf[tf] = {"skipped_due_tf_disagree": True}
-                print(f"  {tf}: disagreement with {higher_tf}")
-                continue
+# strict agreement: all timeframes must point same direction
+directions = {}
 
-        crt_b, crt_s = detect_crt(df)
-        ts_b, ts_s = detect_turtle(df)
-        bias = smc_bias(df)
-        vol_ok = volume_ok(df)
+for tf, df in tf_data.items():
+    if df is None:
+        directions[tf] = None
+        continue
 
-        bull_score = (WEIGHT_CRT*(1 if crt_b else 0) + WEIGHT_TURTLE*(1 if ts_b else 0) +
-                      WEIGHT_VOLUME*(1 if vol_ok else 0) + WEIGHT_BIAS*(1 if bias=="bull" else 0)) * 100
-        bear_score = (WEIGHT_CRT*(1 if crt_s else 0) + WEIGHT_TURTLE*(1 if ts_s else 0) +
-                      WEIGHT_VOLUME*(1 if vol_ok else 0) + WEIGHT_BIAS*(1 if bias=="bear" else 0)) * 100
+    crt_b, crt_s = detect_crt(df)
+    ts_b, ts_s = detect_turtle(df)
+    bias = smc_bias(df)
+    vol_ok = volume_ok(df)
 
-        breakdown_per_tf[tf] = {
-            "bull_score": int(bull_score),
-            "bear_score": int(bear_score),
-            "bias": bias,
-            "vol_ok": vol_ok,
-            "crt_b": bool(crt_b),
-            "crt_s": bool(crt_s),
-            "ts_b": bool(ts_b),
-            "ts_s": bool(ts_s)
-        }
+    bull_score = (
+        WEIGHT_CRT*(1 if crt_b else 0) +
+        WEIGHT_TURTLE*(1 if ts_b else 0) +
+        WEIGHT_VOLUME*(1 if vol_ok else 0) +
+        WEIGHT_BIAS*(1 if bias=="bull" else 0)
+    ) * 100
 
-        per_tf_scores.append(max(bull_score, bear_score))
+    bear_score = (
+        WEIGHT_CRT*(1 if crt_s else 0) +
+        WEIGHT_TURTLE*(1 if ts_s else 0) +
+        WEIGHT_VOLUME*(1 if vol_ok else 0) +
+        WEIGHT_BIAS*(1 if bias=="bear" else 0)
+    ) * 100
 
-        if bull_score >= MIN_TF_SCORE:
-            tf_confirmations += 1
-            chosen_dir    = "BUY"
-            chosen_entry  = float(df["close"].iloc[-1])
-            chosen_tf     = tf
-        elif bear_score >= MIN_TF_SCORE:
-            tf_confirmations += 1
-            chosen_dir    = "SELL"
-            chosen_entry  = float(df["close"].iloc[-1])
-            chosen_tf     = tf
+    breakdown_per_tf[tf] = {
+        "bull_score": int(bull_score),
+        "bear_score": int(bear_score),
+        "bias": bias,
+        "vol_ok": vol_ok,
+        "crt_b": bool(crt_b),
+        "crt_s": bool(crt_s),
+        "ts_b": bool(ts_b),
+        "ts_s": bool(ts_s)
+    }
 
-    print(f"  {symbol} confirmations: {tf_confirmations}/{len(TIMEFRAMES)}")
+    per_tf_scores.append(max(bull_score, bear_score))
 
-    # require at least CONF_MIN_TFS confirmations
-    if not (tf_confirmations >= CONF_MIN_TFS and chosen_dir and chosen_entry is not None):
-        skipped_signals += 1
-        return False
+    # determine direction for this TF
+    if bull_score >= MIN_TF_SCORE:
+        directions[tf] = "BUY"
+    elif bear_score >= MIN_TF_SCORE:
+        directions[tf] = "SELL"
+    else:
+        directions[tf] = None
 
-    # compute confidence
-    confidence_pct = float(np.mean(per_tf_scores)) if per_tf_scores else 100.0
-    confidence_pct = max(0.0, min(100.0, confidence_pct))
+# -------- strict check: all TF must match --------
+unique_dirs = set(directions.values()) - {None}
+
+if len(unique_dirs) != 1:
+    print(f"{symbol}: strict TF disagreement → SKIPPED")
+    skipped_signals += 1
+    return False
+
+# only one direction remains
+chosen_dir = unique_dirs.pop()
+
+# pick entry from highest TF for stability
+highest_tf = TIMEFRAMES[-1]
+chosen_entry = float(tf_data[highest_tf]["close"].iloc[-1])
+chosen_tf = highest_tf
+
+print(f"  STRICT TF AGREEMENT → {chosen_dir} @ {chosen_entry}")
+
+# compute confidence
+confidence_pct = float(np.mean(per_tf_scores)) if per_tf_scores else 100.0
+confidence_pct = max(0.0, min(100.0, confidence_pct))
 
     # safety fallback: require confidence threshold
     if confidence_pct < CONFIDENCE_MIN or tf_confirmations < CONF_MIN_TFS:
