@@ -759,23 +759,32 @@ def analyze_symbol(symbol):
         else:
             directions[tf] = None
 
-    # -------- strict check: all TF must match --------
-    unique_dirs = set(directions.values()) - {None}
+    # -------- STRICT-BALANCED CHECK: at least 2 of 3 TF AGREE --------
+    valid_dirs = [d for d in directions.values() if d is not None]
 
-    if len(unique_dirs) != 1:
-        print(f"{symbol}: strict TF disagreement → SKIPPED")
+    if len(valid_dirs) < 2:
+        print(f"{symbol}: not enough valid TF signals → SKIPPED")
         skipped_signals += 1
         return False
 
-    # only one direction remains
-    chosen_dir = unique_dirs.pop()
+    buy_count  = valid_dirs.count("BUY")
+    sell_count = valid_dirs.count("SELL")
 
-    # pick entry from highest TF for stability
+    if buy_count >= 2:
+        chosen_dir = "BUY"
+    elif sell_count >= 2:
+        chosen_dir = "SELL"
+    else:
+        print(f"{symbol}: no 2/3 agreement → SKIPPED")
+        skipped_signals += 1
+        return False
+
+    # pick entry from highest TF (Daily)
     highest_tf = TIMEFRAMES[-1]
     chosen_entry = float(tf_data[highest_tf]["close"].iloc[-1])
     chosen_tf = highest_tf
 
-    print(f"  STRICT TF AGREEMENT → {chosen_dir} @ {chosen_entry}")
+    print(f"  STRICT-BALANCED 2/3 AGREEMENT → {chosen_dir} @ {chosen_entry}")
 
     # compute confidence
     confidence_pct = float(np.mean(per_tf_scores)) if per_tf_scores else 100.0
