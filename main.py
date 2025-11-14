@@ -44,9 +44,9 @@ WEIGHT_TURTLE = 0.25
 WEIGHT_CRT    = 0.20
 WEIGHT_VOLUME = 0.15
 
-MIN_TF_SCORE  = 50
+MIN_TF_SCORE  = 60.0
 CONF_MIN_TFS  = 1
-CONFIDENCE_MIN = 55.0
+CONFIDENCE_MIN = 60.0
 MIN_QUOTE_VOLUME = 5_000_000
 
 # ============================================================
