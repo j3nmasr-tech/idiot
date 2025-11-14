@@ -614,21 +614,20 @@ def analyze_symbol(symbol):
     btc_adx = btc_adx_4h_ok()
     print("  BTC 4H ADX:", btc_adx)
 
-    # ===== BTC direction check (ETH-style: only require it to exist) =====
-    if btc_dir is None:
-        print(f"Skipping {symbol}: BTC direction unavailable.")
-        skipped_signals += 1
-        return False
+    # ===== BTC direction check (BTC ONLY) =====
+    if symbol == "BTCUSDT":
+        if btc_dir is None:
+            print("Skipping BTCUSDT: BTC direction unavailable.")
+            skipped_signals += 1
+            return False
 
-    # Do NOT force btc_dir to match trade direction.
-    # BTC is now allowed to take buy/sell signals even if dir = BEAR/BULL.
-    
-    # Apply ADX & Dominance filters but be lenient for BTC/ETH themselves
+    # ===== ADX & dominance filters (ALTS ONLY — ETH & BTC bypass) =====
     if symbol not in ["BTCUSDT", "ETHUSDT"]:
         if btc_adx is None or btc_adx < BTC_ADX_MIN:
             print(f"Skipping {symbol}: BTC ADX {btc_adx} too low (alts suppressed).")
             skipped_signals += 1
             return False
+
         if btc_dom is not None and btc_dom > BTC_DOMINANCE_MAX:
             print(f"Skipping {symbol}: BTC dominance {btc_dom:.2f}% > {BTC_DOMINANCE_MAX}% (alts suppressed).")
             skipped_signals += 1
