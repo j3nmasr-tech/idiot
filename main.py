@@ -75,7 +75,7 @@ OKX_INSTR    = "https://www.okx.com/api/v5/public/instruments"
 LOG_CSV = "./sirts_swing_signals_okx.csv"
 
 MAX_OPEN_TRADES = 5
-MAX_EXPOSURE_PCT = 0.25
+MAX_EXPOSURE_PCT = 10.0
 MIN_MARGIN_USD = 1.0
 MIN_SL_DISTANCE_PCT = 0.005
 
@@ -280,10 +280,9 @@ def trade_params(symbol, entry, side, atr_multiplier_sl=2.0, tp_mults=(2.0,3.0,4
         tp3 = entry - atr * tp_mults[2]
     return sl, tp1, tp2, tp3
 
-def pos_size_units(symbol, entry, sl, confidence_pct):
-    risk_percent = max(0.01, min(0.06, 0.05 + (confidence_pct / 100) * 0.01))
+def pos_size_units(entry, sl, confidence_pct):
+    risk_percent = max(0.01, min(0.06, 0.05 + (confidence_pct/100)*0.01))
     risk_usd = CAPITAL * risk_percent
-
     sl_dist = abs(entry - sl)
     min_sl = max(entry * MIN_SL_DISTANCE_PCT, 1e-8)
     if sl_dist < min_sl:
@@ -293,11 +292,8 @@ def pos_size_units(symbol, entry, sl, confidence_pct):
     exposure = units * entry
     max_exposure = CAPITAL * MAX_EXPOSURE_PCT
 
-    # ⭐ BTC ignores exposure restrictions
-    if symbol != "BTC":
-        if exposure > max_exposure:
-            units = max_exposure / entry
-            exposure = units * entry
+    if exposure > max_exposure:
+        units = max_exposure / entry
 
     margin_req = exposure / LEVERAGE
 
