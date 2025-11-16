@@ -87,17 +87,31 @@ def interval_to_okx(interval):
          "1h":"1H","2h":"2H","4h":"4H","1d":"1D","1w":"1W"}
     return m.get(interval.lower(), interval.upper())
 
-def get_klines(symbol, interval="4H", limit=200):
+def get_klines(symbol, interval="4H", limit=60):  # <-- reduced from 200/300
+    """
+    Fetch OKX candles for a symbol.
+    Reduced limit to speed up API calls for swing bot.
+    """
     symbol = sanitize_symbol(symbol)
-    if not symbol: return None
-    params = {"instId": f"{symbol}-USDT-SWAP","bar": interval_to_okx(interval),"limit":limit}
-    j = safe_get_json(OKX_KLINES, params=params)
-    if not j or "data" not in j: return None
+    if not symbol: 
+        return None
+    params = {
+        "instId": f"{symbol}-USDT-SWAP",
+        "bar": interval_to_okx(interval),
+        "limit": limit
+    }
+    j = safe_get_json(OKX_KLINES, params=params, timeout=5, retries=3)  # add retries
+    if not j or "data" not in j: 
+        return None
     data = j["data"]
+    if not data: 
+        return None
     df = pd.DataFrame(data)
-    df = df.iloc[:,0:5]  # timestamp, open, high, low, close, volume
+    df = df.iloc[:,0:6]  # timestamp, open, high, low, close, volume
     df.columns = ["ts","open","high","low","close","volume"]
-    df = df.astype(float)
+    # ensure numeric
+    for col in ["open","high","low","close","volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
 
 def get_price(symbol):
