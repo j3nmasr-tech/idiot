@@ -64,7 +64,7 @@ MIN_TF_SCORE  = 55
 CONF_MIN_TFS  = 2
 CONFIDENCE_MIN = 60.0
 
-MIN_QUOTE_VOLUME = 5000000
+MIN_QUOTE_VOLUME = 500
 TOP_SYMBOLS = 20
 
 OKX_KLINES   = "https://www.okx.com/api/v5/market/candles"
