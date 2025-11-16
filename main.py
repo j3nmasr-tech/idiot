@@ -335,7 +335,7 @@ send_message("✅ SIRTS Swing Bot Signal-Only deployed on OKX.")
 SYMBOLS = get_okx_swaps(TOP_SYMBOLS)
 print("[DEBUG] Trading symbols fetched:", SYMBOLS)
 
-CYCLE_DELAY = 900  # 15 minutes (reduce to 5-10 sec for testing)
+CYCLE_DELAY = 60  # 15 minutes (reduce to 5-10 sec for testing)
 API_CALL_DELAY = 0.2  # can reduce for testing
 
 while True:
