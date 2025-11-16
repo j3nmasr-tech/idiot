@@ -301,14 +301,16 @@ def analyze_symbol(symbol):
 # ===== MAIN LOOP =====
 init_csv()
 send_message("✅ SIRTS Swing Bot Signal-Only deployed on OKX.")
-SYMBOLS = get_okx_swaps()
-print("Scanning symbols:", SYMBOLS)
+SYMBOLS = ["BTC","ETH","XRP","LTC"]  # Replace with top 80 symbols dynamically if needed
 
 while True:
+    cycle_start = datetime.utcnow()
     for sym in SYMBOLS:
         try:
-            analyze_symbol(sym)
+            result = analyze_symbol(sym)
+            status = "✅ signal sent" if result else "❌ no signal"
+            print(f"{sym} scanned at {datetime.utcnow().strftime('%H:%M:%S UTC')} → {status}")
         except Exception as e:
             print(f"Error scanning {sym}: {e}")
         time.sleep(API_CALL_DELAY)
-    print(f"Cycle completed at {datetime.utcnow().strftime('%H:%M:%S UTC')}.")
+    print(f"Cycle completed at {datetime.utcnow().strftime('%H:%M:%S UTC')}.\n")
