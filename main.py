@@ -69,6 +69,7 @@ def send_message(text):
         print("Telegram send error:", e)
         return False
 
+# ===== SAFE GET JSON WITH 400 SKIP =====
 def safe_get_json(url, params=None, timeout=3, retries=1):
     for attempt in range(retries+1):
         try:
@@ -77,35 +78,31 @@ def safe_get_json(url, params=None, timeout=3, retries=1):
             return r.json()
         except requests.HTTPError as e:
             if r.status_code == 400:
-                print(f"Skipping bad request: url={url} params={params}")
+                print(f"Skipping invalid instrument: {params}")
                 return None
-            print(f"HTTP error: {e} url={url} params={params}")
+            print(f"Request error: {e} url={url} params={params}")
+            if attempt < retries:
+                time.sleep(0.2)
+                continue
+            return None
         except Exception as e:
             print(f"Request error: {e} url={url} params={params}")
-        if attempt < retries:
-            time.sleep(0.2)
-    return None
+            if attempt < retries:
+                time.sleep(0.2)
+                continue
+            return None
 
 def interval_to_okx(interval):
-    # OKX uses: 1m, 3m, 5m, 15m, 30m, 1H, 2H, 4H, 6H, 12H, 1D, 1W
     m = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
          "1h":"1H","2h":"2H","4h":"4H","1d":"1D","1w":"1W"}
     return m.get(interval.lower(), interval.upper())
 
-def get_klines(symbol, interval="4H", limit=60):  # <-- reduced from 200/300
-    """
-    Fetch OKX candles for a symbol.
-    Reduced limit to speed up API calls for swing bot.
-    """
+def get_klines(symbol, interval="4H", limit=60):
     symbol = sanitize_symbol(symbol)
     if not symbol: 
         return None
-    params = {
-        "instId": f"{symbol}-USDT-SWAP",
-        "bar": interval_to_okx(interval),
-        "limit": limit
-    }
-    j = safe_get_json(OKX_KLINES, params=params, timeout=5, retries=3)  # add retries
+    params = {"instId": f"{symbol}-USDT-SWAP", "bar": interval_to_okx(interval), "limit": limit}
+    j = safe_get_json(OKX_KLINES, params=params, timeout=5, retries=3)
     if not j or "data" not in j: 
         return None
     data = j["data"]
@@ -114,7 +111,6 @@ def get_klines(symbol, interval="4H", limit=60):  # <-- reduced from 200/300
     df = pd.DataFrame(data)
     df = df.iloc[:,0:6]  # timestamp, open, high, low, close, volume
     df.columns = ["ts","open","high","low","close","volume"]
-    # ensure numeric
     for col in ["open","high","low","close","volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
@@ -202,8 +198,8 @@ def pos_size_units(entry, sl, confidence_pct):
 
 # ===== BTC TREND & VOLATILITY =====
 def btc_trend_agree():
-    df1 = get_klines("BTC","4H",60)  # instead of 300
-    df2 = get_klines("BTC","1D",60)  # instead of 300
+    df1 = get_klines("BTC","4H",60)
+    df2 = get_klines("BTC","1D",60)
     if df1 is None or df2 is None: return None,None,None
     b1,b2 = smc_bias(df1), smc_bias(df2)
     sma200 = df2["close"].rolling(200).mean().iloc[-1] if len(df2)>=200 else None
@@ -231,6 +227,20 @@ def log_signal(row):
             writer.writerow(row)
     except Exception as e:
         print("log_signal error:", e)
+
+# ===== DYNAMIC SYMBOL FETCH =====
+def get_okx_swaps(top_n=TOP_SYMBOLS):
+    url = "https://www.okx.com/api/v5/public/instruments"
+    params = {"instType":"SWAP", "uly":"USDT"}
+    data = safe_get_json(url, params=params, timeout=5, retries=2)
+    swaps = []
+    if data and "data" in data:
+        for inst in data["data"]:
+            inst_id = inst.get("instId","")
+            if inst_id.endswith("-USDT-SWAP"):
+                symbol = inst_id.replace("-USDT-SWAP","")
+                swaps.append(symbol)
+    return swaps[:top_n]
 
 # ===== ANALYSIS & SIGNAL GENERATION =====
 def analyze_symbol(symbol):
@@ -281,7 +291,6 @@ def analyze_symbol(symbol):
     units,margin,exposure,risk_used = pos_size_units(chosen_entry,sl,confidence_pct)
     if units<=0 or exposure>CAPITAL*MAX_EXPOSURE_PCT: return False
 
-    # LOG + ALERT
     send_message(f"✅ {chosen_dir} {symbol}\nEntry: {chosen_entry}\nTP1:{tp1} TP2:{tp2} TP3:{tp3}\nSL:{sl}\nUnits:{units} Margin:${margin} Exposure:${exposure}\nConf:{confidence_pct:.1f}% TFs:{', '.join(confirming_tfs)}")
     log_signal([datetime.utcnow().isoformat(),symbol,chosen_dir,chosen_entry,tp1,tp2,tp3,sl,','.join(confirming_tfs),units,margin,exposure,risk_used,confidence_pct,"open"])
     open_trades.append({"symbol":symbol,"side":chosen_dir,"entry":chosen_entry,"tp1":tp1,"tp2":tp2,"tp3":tp3,"sl":sl,"units":units,"margin":margin,"exposure":exposure,"confidence_pct":confidence_pct,"status":"open"})
@@ -292,17 +301,14 @@ def analyze_symbol(symbol):
 # ===== MAIN LOOP =====
 init_csv()
 send_message("✅ SIRTS Swing Bot Signal-Only deployed on OKX.")
-SYMBOLS = ["BTC","ETH","XRP","LTC"]  # Replace with top valid USDT-SWAP pairs
+SYMBOLS = get_okx_swaps()
+print("Scanning symbols:", SYMBOLS)
 
 while True:
     for sym in SYMBOLS:
         try:
-            # Skip if symbol data invalid
-            success = analyze_symbol(sym)
-            if success:
-                print(f"Signal sent for {sym}")
+            analyze_symbol(sym)
         except Exception as e:
             print(f"Error scanning {sym}: {e}")
         time.sleep(API_CALL_DELAY)
-    # Use timezone-aware datetime to avoid deprecation warning
-    print(f"Cycle completed at {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}.")
+    print(f"Cycle completed at {datetime.utcnow().strftime('%H:%M:%S UTC')}.")
