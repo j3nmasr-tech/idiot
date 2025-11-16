@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SIRTS Swing Bot v2 — Bybit USDT Perps | Signal-Only | Top 80
+# SIRTS Swing Bot v1 — OKX USDT Perps | Signal-Only
 # Requirements: requests, pandas, numpy
 # Environment variables: BOT_TOKEN, CHAT_ID
 
@@ -19,10 +19,9 @@ COOLDOWN_TIME_FAIL    = 10800      # 3h
 
 VOLATILITY_THRESHOLD_PCT = 3.0
 VOLATILITY_PAUSE = 3600
-CHECK_INTERVAL = 120
-API_CALL_DELAY = 0.2  # Bybit rate-limit safety
+API_CALL_DELAY = 0.2  # rate-limit safety
 
-TIMEFRAMES = ["4h", "1d", "1w"]  # swing TFs
+TIMEFRAMES = ["4H", "1D", "1W"]  # swing TFs
 WEIGHT_BIAS   = 0.40
 WEIGHT_TURTLE = 0.25
 WEIGHT_CRT    = 0.20
@@ -35,12 +34,11 @@ CONFIDENCE_MIN = 60.0
 MIN_QUOTE_VOLUME = 5000000  # $5M 24h minimum
 TOP_SYMBOLS = 80
 
-BYBIT_BASE      = "https://api.bybit.com"
-BYBIT_KLINES    = f"{BYBIT_BASE}/v5/market/kline"
-BYBIT_TICKERS   = f"{BYBIT_BASE}/v5/market/tickers"
+OKX_KLINES   = "https://www.okx.com/api/v5/market/candles"
+OKX_TICKERS  = "https://www.okx.com/api/v5/market/tickers"
 COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
 
-LOG_CSV = "./sirts_swing_signals.csv"
+LOG_CSV = "./sirts_swing_signals_okx.csv"
 
 MAX_OPEN_TRADES = 5
 MAX_EXPOSURE_PCT = 0.25
@@ -71,7 +69,7 @@ def send_message(text):
         print("Telegram send error:", e)
         return False
 
-def safe_get_json(url, params=None, timeout=5, retries=1):
+def safe_get_json(url, params=None, timeout=5, retries=2):
     for attempt in range(retries+1):
         try:
             r = requests.get(url, params=params, timeout=timeout)
@@ -83,119 +81,79 @@ def safe_get_json(url, params=None, timeout=5, retries=1):
                 continue
             return None
 
-def interval_to_bybit(interval):
-    m = {"1m":"1", "3m":"3", "5m":"5", "15m":"15", "30m":"30",
-         "1h":"60","2h":"120","4h":"240","1d":"D","1w":"W"}
-    return m.get(interval, interval)
+def interval_to_okx(interval):
+    # OKX uses: 1m, 3m, 5m, 15m, 30m, 1H, 2H, 4H, 6H, 12H, 1D, 1W
+    m = {"1m":"1m","3m":"3m","5m":"5m","15m":"15m","30m":"30m",
+         "1h":"1H","2h":"2H","4h":"4H","1d":"1D","1w":"1W"}
+    return m.get(interval.lower(), interval.upper())
 
-def get_klines(symbol, interval="4h", limit=200):
+def get_klines(symbol, interval="4H", limit=200):
     symbol = sanitize_symbol(symbol)
-    if not symbol:
-        return None
-    iv = interval_to_bybit(interval)
-    params = {"category":"linear","symbol":symbol,"interval":iv,"limit":limit}
-    j = safe_get_json(BYBIT_KLINES, params=params)
-    if not j or "result" not in j or "list" not in j["result"]:
-        return None
-    data = j["result"]["list"]
-    if isinstance(data[0], dict):
-        df = pd.DataFrame(data)
-        df = df.rename(columns={"o":"open","h":"high","l":"low","c":"close","v":"volume"}) if "o" in df else df
-        df = df[["open","high","low","close","volume"]].astype(float)
-    elif isinstance(data[0], list):
-        df = pd.DataFrame(data)
-        df = df.iloc[:,1:6]
-        df.columns = ["open","high","low","close","volume"]
-        df = df.astype(float)
-    else:
-        return None
+    if not symbol: return None
+    params = {"instId": f"{symbol}-USDT-SWAP","bar": interval_to_okx(interval),"limit":limit}
+    j = safe_get_json(OKX_KLINES, params=params)
+    if not j or "data" not in j: return None
+    data = j["data"]
+    df = pd.DataFrame(data)
+    df = df.iloc[:,0:5]  # timestamp, open, high, low, close, volume
+    df.columns = ["ts","open","high","low","close","volume"]
+    df = df.astype(float)
     return df
 
 def get_price(symbol):
     symbol = sanitize_symbol(symbol)
-    j = safe_get_json(BYBIT_TICKERS, params={"category":"linear","symbol":symbol})
-    if not j or "result" not in j or "list" not in j["result"]:
-        return None
-    for d in j["result"]["list"]:
-        if d.get("symbol","").upper() == symbol:
-            return float(d.get("lastPrice", d.get("last_price",0)))
-    return None
+    j = safe_get_json(OKX_TICKERS, params={"instId": f"{symbol}-USDT-SWAP"})
+    if not j or "data" not in j or len(j["data"])==0: return None
+    return float(j["data"][0].get("last","0"))
 
 def get_24h_quote_volume(symbol):
     symbol = sanitize_symbol(symbol)
-    j = safe_get_json(BYBIT_TICKERS, params={"category":"linear","symbol":symbol})
-    if not j or "result" not in j or "list" not in j["result"]:
-        return 0.0
-    for d in j["result"]["list"]:
-        if d.get("symbol","").upper() == symbol:
-            vol  = float(d.get("volume24h",0))
-            last = float(d.get("lastPrice",1))
-            return vol * last
-    return 0.0
-
-# ===== GET TOP SYMBOLS =====
-def get_top_symbols(n=80):
-    j = safe_get_json(BYBIT_TICKERS, params={"category":"linear"})
-    if not j or "result" not in j or "list" not in j["result"]:
-        return ["BTCUSDT","ETHUSDT"]
-    tickers = j["result"]["list"]
-    sym_vol = []
-    for d in tickers:
-        sym = d.get("symbol","")
-        if not sym.endswith("USDT"):
-            continue
-        try:
-            vol24 = float(d.get("volume24h",0))
-            price = float(d.get("lastPrice",0)) or 1.0
-            quote_vol = vol24*price
-            sym_vol.append((sym,quote_vol))
-        except:
-            continue
-    sym_vol.sort(key=lambda x:x[1], reverse=True)
-    top = [s for s,v in sym_vol[:n]]
-    return top
+    j = safe_get_json(OKX_TICKERS, params={"instId": f"{symbol}-USDT-SWAP"})
+    if not j or "data" not in j or len(j["data"])==0: return 0.0
+    d = j["data"][0]
+    return float(d.get("volCcy24h",0)) * float(d.get("last","1"))
 
 # ===== INDICATORS =====
 def smc_bias(df):
     e20 = df["close"].ewm(span=20).mean().iloc[-1]
     e50 = df["close"].ewm(span=50).mean().iloc[-1]
-    return "bull" if e20>e50 else "bear"
+    return "bull" if e20 > e50 else "bear"
 
 def detect_crt(df):
-    if len(df)<12: return False,False
+    if len(df) < 12: return False, False
     last = df.iloc[-1]
-    o,h,l,c,v = last["open"],last["high"],last["low"],last["close"],last["volume"]
+    o, h, l, c, v = last["open"], last["high"], last["low"], last["close"], last["volume"]
     body_series = (df["close"]-df["open"]).abs()
-    avg_body = body_series.rolling(8,min_periods=6).mean().iloc[-1]
+    avg_body = body_series.rolling(8, min_periods=6).mean().iloc[-1]
     avg_vol = df["volume"].rolling(8,min_periods=6).mean().iloc[-1]
-    if np.isnan(avg_body) or np.isnan(avg_vol): return False,False
+    if np.isnan(avg_body) or np.isnan(avg_vol): return False, False
     body = abs(c-o)
     wick_up, wick_down = h-max(o,c), min(o,c)-l
     bull = (body<avg_body*0.8) and (wick_down>avg_body*0.5) and (v<avg_vol*1.5) and (c>o)
     bear = (body<avg_body*0.8) and (wick_up>avg_body*0.5) and (v<avg_vol*1.5) and (c<o)
-    return bull,bear
+    return bull, bear
 
 def detect_turtle(df, look=20):
-    if len(df)<look+2: return False,False
+    if len(df) < look+2: return False, False
     ph = df["high"].iloc[-look-1:-1].max()
     pl = df["low"].iloc[-look-1:-1].min()
     last = df.iloc[-1]
-    bull = last["low"]<pl and last["close"]>pl*1.002
-    bear = last["high"]>ph and last["close"]<ph*0.998
-    return bull,bear
+    bull = last["low"] < pl and last["close"] > pl*1.002
+    bear = last["high"] > ph and last["close"] < ph*0.998
+    return bull, bear
 
 def volume_ok(df):
     ma = df["volume"].rolling(20,min_periods=8).mean().iloc[-1]
     if np.isnan(ma): return True
-    return df["volume"].iloc[-1]>ma*1.3
+    return df["volume"].iloc[-1] > ma*1.3
 
 # ===== ATR & POSITION SIZING =====
 def get_atr(symbol, period=14):
-    df = get_klines(symbol,"4h",period+1)
+    df = get_klines(symbol,"4H",period+1)
     if df is None or len(df)<period+1: return None
-    h,l,c = df["high"].values, df["low"].values, df["close"].values
+    h, l, c = df["high"].values, df["low"].values, df["close"].values
     trs = [max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])) for i in range(1,len(df))]
-    return max(float(np.mean(trs)),1e-8)
+    return max(float(np.mean(trs)), 1e-8)
 
 def trade_params(symbol, entry, side, atr_multiplier_sl=2.0, tp_mults=(2.0,3.0,4.0)):
     atr = get_atr(symbol)
@@ -203,10 +161,10 @@ def trade_params(symbol, entry, side, atr_multiplier_sl=2.0, tp_mults=(2.0,3.0,4
     atr = max(min(atr, entry*0.1), entry*0.001)
     if side=="BUY":
         sl = entry - atr*atr_multiplier_sl
-        tp1,tp2,tp3 = entry+atr*tp_mults[0], entry+atr*tp_mults[1], entry+atr*tp_mults[2]
+        tp1,tp2,tp3 = entry + atr*tp_mults[0], entry + atr*tp_mults[1], entry + atr*tp_mults[2]
     else:
         sl = entry + atr*atr_multiplier_sl
-        tp1,tp2,tp3 = entry-atr*tp_mults[0], entry-atr*tp_mults[1], entry-atr*tp_mults[2]
+        tp1,tp2,tp3 = entry - atr*tp_mults[0], entry - atr*tp_mults[1], entry - atr*tp_mults[2]
     return sl,tp1,tp2,tp3
 
 def pos_size_units(entry, sl, confidence_pct):
@@ -225,8 +183,8 @@ def pos_size_units(entry, sl, confidence_pct):
 
 # ===== BTC TREND & VOLATILITY =====
 def btc_trend_agree():
-    df1 = get_klines("BTCUSDT","4h",300)
-    df2 = get_klines("BTCUSDT","1d",300)
+    df1 = get_klines("BTC","4H",300)
+    df2 = get_klines("BTC","1D",300)
     if df1 is None or df2 is None: return None,None,None
     b1,b2 = smc_bias(df1), smc_bias(df2)
     sma200 = df2["close"].rolling(200).mean().iloc[-1] if len(df2)>=200 else None
@@ -235,7 +193,7 @@ def btc_trend_agree():
     return (b1==b2),(b1 if b1==b2 else None),trend_by_sma
 
 def btc_volatility_spike():
-    df = get_klines("BTCUSDT","1h",3)
+    df = get_klines("BTC","1H",3)
     if df is None or len(df)<3: return False
     pct = (df["close"].iloc[-1]-df["close"].iloc[0])/df["close"].iloc[0]*100
     return abs(pct)>=VOLATILITY_THRESHOLD_PCT
@@ -257,7 +215,7 @@ def log_signal(row):
 
 # ===== ANALYSIS & SIGNAL GENERATION =====
 def analyze_symbol(symbol):
-    global open_trades,recent_signals,last_trade_time
+    global open_trades, recent_signals, last_trade_time
     now = time.time()
     if symbol in recent_signals and recent_signals[symbol]+RECENT_SIGNAL_SIGNATURE_EXPIRE>now:
         return False
@@ -265,7 +223,7 @@ def analyze_symbol(symbol):
     if vol24<MIN_QUOTE_VOLUME: return False
     if last_trade_time.get(symbol,0)>now: return False
 
-    if symbol!="BTCUSDT":
+    if symbol!="BTC":
         btc_ok, btc_dir, btc_sma = btc_trend_agree()
         if btc_ok is False or btc_dir is None: return False
         if btc_dir=="bear": return False  # block BUY
@@ -312,25 +270,16 @@ def analyze_symbol(symbol):
     last_trade_time[symbol]=now+COOLDOWN_TIME_DEFAULT
     return True
 
-# ===== MAIN LOOP (15-minute interval) =====
+# ===== MAIN LOOP =====
 init_csv()
-send_message("✅ SIRTS Swing Bot Signal-Only deployed.")
+send_message("✅ SIRTS Swing Bot Signal-Only deployed on OKX.")
+SYMBOLS = ["BTC","ETH","XRP","LTC"]  # Replace with top 80 symbols dynamically if needed
 
 while True:
-    start_time = time.time()
-    SYMBOLS = get_top_symbols(TOP_SYMBOLS)
-    print("Top symbols:", SYMBOLS)
-
-    # Scan all symbols
     for sym in SYMBOLS:
         try:
             analyze_symbol(sym)
         except Exception as e:
             print(f"Error scanning {sym}: {e}")
         time.sleep(API_CALL_DELAY)
-
-    # Wait until 15 minutes have passed since start of cycle
-    elapsed = time.time() - start_time
-    sleep_time = max(0, 15*60 - elapsed)
-    print(f"Cycle completed at {datetime.utcnow().strftime('%H:%M:%S UTC')}, sleeping {sleep_time:.1f}s until next cycle.")
-    time.sleep(sleep_time)
+    print(f"Cycle completed at {datetime.utcnow().strftime('%H:%M:%S UTC')}.")
