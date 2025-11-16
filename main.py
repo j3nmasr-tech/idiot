@@ -197,8 +197,8 @@ def pos_size_units(entry, sl, confidence_pct):
 
 # ===== BTC TREND & VOLATILITY =====
 def btc_trend_agree():
-    df1 = get_klines("BTC","4H",300)
-    df2 = get_klines("BTC","1D",300)
+    df1 = get_klines("BTC","4H",60)  # instead of 300
+    df2 = get_klines("BTC","1D",60)  # instead of 300
     if df1 is None or df2 is None: return None,None,None
     b1,b2 = smc_bias(df1), smc_bias(df2)
     sma200 = df2["close"].rolling(200).mean().iloc[-1] if len(df2)>=200 else None
