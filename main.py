@@ -67,10 +67,11 @@ CONFIDENCE_MIN = 60.0
 MIN_QUOTE_VOLUME = 500
 TOP_SYMBOLS = 20
 
+# ===== OKX ENDPOINTS =====
 OKX_KLINES   = "https://www.okx.com/api/v5/market/candles"
-OKX_TICKERS  = "https://www.okx.com/api/v5/market/tickers"
+OKX_TICKER   = "https://www.okx.com/api/v5/market/ticker"   # <-- FIXED (single instrument)
+OKX_TICKERS  = "https://www.okx.com/api/v5/market/tickers"  # all instruments
 OKX_INSTR    = "https://www.okx.com/api/v5/public/instruments"
-
 LOG_CSV = "./sirts_swing_signals_okx.csv"
 
 MAX_OPEN_TRADES = 5
@@ -190,20 +191,31 @@ def get_price(symbol):
 
 def get_24h_quote_volume(symbol):
     symbol = sanitize_symbol(symbol)
-    j = safe_get_json(OKX_TICKERS, params={"instId": f"{symbol}-USDT-SWAP"})
-    if not j or "data" not in j or len(j["data"])==0:
+    inst = f"{symbol}-USDT-SWAP"
+    debug_print(f"[get_24h_quote_volume] Fetching volume for {inst}")
+
+    # SINGLE instrument endpoint (correct)
+    j = safe_get_json(
+        OKX_TICKER,                 # <-- FIXED
+        params={"instId": inst},
+        timeout=6,
+        retries=2
+    )
+
+    if not j or "data" not in j or len(j["data"]) == 0:
+        debug_print(f"[get_24h_quote_volume] No data for {inst}, returning 0")
         return 0.0
+
     d = j["data"][0]
-    # volCcy24h is quote-currency volume e.g. USDT volume; multiply by last to be safe if needed
+
+    # volCcy24h = volume in quote currency (USDT)
     try:
         vol_ccy = float(d.get("volCcy24h", 0))
-    except Exception:
+    except:
         vol_ccy = 0.0
-    try:
-        last = float(d.get("last", 1))
-    except Exception:
-        last = 1.0
-    return vol_ccy * last
+
+    debug_print(f"[get_24h_quote_volume] {symbol} volCcy24h = {vol_ccy}")
+    return vol_ccy
 
 # ===== INDICATORS =====
 def smc_bias(df):
