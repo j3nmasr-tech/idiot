@@ -630,7 +630,7 @@ def tf_agree(symbol, tf_low, tf_high):
     
     # Require STRONG agreement for swing
     return dir_low == dir_high
-
+    
 # ===== SWING ATR & POSITION SIZING =====
 def get_atr(symbol, period=14):
     """SWING ADAPTED: Use daily ATR for swing trading"""
