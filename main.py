@@ -47,23 +47,23 @@ WEIGHT_CRT    = 0.30    # More on reversals
 WEIGHT_VOLUME = 0.10    # Minimal volume reliance
 
 # ===== ACTIVE TRADER BALANCE =====
-MIN_TF_SCORE  = 45      # Slightly more permissive
+MIN_TF_SCORE  = 55      # Slightly more permissive
 CONF_MIN_TFS  = 2       # Same
-CONFIDENCE_MIN = 45.0   # Reduced from 62.0
+CONFIDENCE_MIN = 58.0   # Reduced from 62.0
 MIN_QUOTE_VOLUME = 1_500_000.0  # More symbols qualify
 TOP_SYMBOLS = 70        # More opportunities
 
 # ===== ADVANCED FILTERS CONFIG =====
 ENABLE_MARKET_REGIME_FILTER = False  # Disabled - too restrictive
-ENABLE_SR_FILTER = False              # Keep enabled - good filter
-ENABLE_MOMENTUM_FILTER = False        # Keep enabled - good filter  
+ENABLE_SR_FILTER = True              # Keep enabled - good filter
+ENABLE_MOMENTUM_FILTER = True        # Keep enabled - good filter  
 ENABLE_BTC_DOMINANCE_FILTER = False  # Disabled - too restrictive
 
 # ===== MOMENTUM INTEGRITY FRAMEWORK (OPTIONAL - CAN BE DISABLED) =====
-ENABLE_TREND_ALIGNMENT_FILTER = False      # Prevents fighting trends (RESOLV/TAO disasters)
-ENABLE_MARKET_CONTEXT_FILTER = False       # Comprehensive context scoring  
-ENABLE_INTELLIGENT_SENTIMENT = False       # Fixes "fear = short" assumption
-ENABLE_CIRCUIT_BREAKER = False             # Prevents revenge trading
+ENABLE_TREND_ALIGNMENT_FILTER = True      # Prevents fighting trends (RESOLV/TAO disasters)
+ENABLE_MARKET_CONTEXT_FILTER = True       # Comprehensive context scoring  
+ENABLE_INTELLIGENT_SENTIMENT = True       # Fixes "fear = short" assumption
+ENABLE_CIRCUIT_BREAKER = True             # Prevents revenge trading
 
 # ===== BYBIT PUBLIC ENDPOINTS =====
 BYBIT_KLINES = "https://api.bybit.com/v5/market/kline"
