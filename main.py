@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SIRTS v10 – Pure Logic Version | Bybit + Detailed Breakdown + REMOVED 2-CRITICAL FILTERS
-# ADDED TIMEFRAMES: 5m, 2h, 3h
+# SIRTS v10 – DATA COLLECTION MODE (NO 5m)
+# REMOVED 5m TIMEFRAME - TOO NOISY FOR SWING STRATEGY
 # Requirements: requests, pandas, numpy
 # BOT_TOKEN and CHAT_ID must be set as environment variables
 
@@ -28,8 +28,8 @@ CAPITAL = 80.0
 LEVERAGE = 30
 COOLDOWN_TIME_DEFAULT = 1800
 
-# ===== EXPANDED TIMEFRAMES =====
-TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "3h", "4h"]  # Added 5m, 2h, 3h
+# ===== CLEANER TIMEFRAMES (NO 5m) =====
+TIMEFRAMES = ["15m", "30m", "1h", "2h", "3h", "4h"]  # REMOVED 5m
 
 # ===== SIGNAL QUALITY WEIGHTS =====
 WEIGHT_BIAS   = 0.25    # EMA bias
@@ -37,10 +37,10 @@ WEIGHT_TURTLE = 0.35    # Breakouts
 WEIGHT_CRT    = 0.30    # Reversals
 WEIGHT_VOLUME = 0.10    # Volume
 
-# ===== THRESHOLDS =====
-MIN_TF_SCORE  = 25      # Minimum score per timeframe
-CONF_MIN_TFS  = 1       # INCREASED: Need at least 2 TFs confirming (was 1)
-CONFIDENCE_MIN = 25.0   # Minimum overall confidence
+# ===== DATA COLLECTION THRESHOLDS =====
+MIN_TF_SCORE  = 25      # Very low to collect all data
+CONF_MIN_TFS  = 1       # Minimum possible
+CONFIDENCE_MIN = 25.0   # Very low to collect all data
 TOP_SYMBOLS = 60        # Number of symbols to monitor
 
 # ===== BYBIT PUBLIC ENDPOINTS =====
@@ -49,7 +49,7 @@ BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
 BYBIT_PRICE = "https://api.bybit.com/v5/market/tickers"
 COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
 
-LOG_CSV = "./sirts_v10_expanded_tf.csv"
+LOG_CSV = "./sirts_v10_no_5m.csv"
 
 # ===== CACHE =====
 SENTIMENT_CACHE = {"data": None, "timestamp": 0}
@@ -72,13 +72,12 @@ skipped_signals      = 0
 last_heartbeat       = time.time()
 last_summary         = time.time()
 
-# ===== FILTER FUNCTIONS (REMOVED 2-CRITICAL RULES) =====
+# ===== FILTER FUNCTIONS (DATA COLLECTION MODE) =====
 def should_accept_signal(symbol, chosen_dir, confirming_tfs, tf_details, entry_tf):
     """
-    NO FILTERS APPLIED - All signals accepted
-    (Removed: 1-hour alignment and adjacent contradiction filters)
+    DATA COLLECTION: Accept all signals
     """
-    return True, "No filters applied - all signals accepted"
+    return True, "DATA_COLLECTION_MODE"
 
 def is_first_entry(symbol):
     """Check if this is the first entry for this symbol"""
@@ -143,10 +142,10 @@ def get_top_symbols(n=TOP_SYMBOLS):
     return syms
 
 def interval_to_bybit(interval):
-    m = {"1m":"1", "3m":"3", "5m":"5", "15m":"15", "30m":"30", "1h":"60", "2h":"120", "3h":"180", "4h":"240", "1d":"D"}
+    m = {"15m":"15", "30m":"30", "1h":"60", "2h":"120", "3h":"180", "4h":"240", "1d":"D"}
     return m.get(interval, interval)
 
-def get_klines(symbol, interval="5m", limit=200):
+def get_klines(symbol, interval="15m", limit=200):
     symbol = sanitize_symbol(symbol)
     if not symbol:
         return None
@@ -328,12 +327,11 @@ def get_swings_for_timeframe(symbol, timeframe):
 def map_higher_tf(entry_tf):
     """Map entry TF to higher timeframes for TP"""
     mapping = {
-        '5m': {'tp1_tf': '15m', 'tp2_tf': '30m', 'tp3_tf': '1h'},    # Added
-        '15m': {'tp1_tf': '30m', 'tp2_tf': '1h', 'tp3_tf': '2h'},    # Updated
-        '30m': {'tp1_tf': '1h', 'tp2_tf': '2h', 'tp3_tf': '3h'},     # Updated
-        '1h': {'tp1_tf': '2h', 'tp2_tf': '3h', 'tp3_tf': '4h'},      # Updated
-        '2h': {'tp1_tf': '3h', 'tp2_tf': '4h', 'tp3_tf': '1d'},      # Added
-        '3h': {'tp1_tf': '4h', 'tp2_tf': '1d', 'tp3_tf': '1w'},      # Added
+        '15m': {'tp1_tf': '30m', 'tp2_tf': '1h', 'tp3_tf': '2h'},
+        '30m': {'tp1_tf': '1h', 'tp2_tf': '2h', 'tp3_tf': '3h'},
+        '1h': {'tp1_tf': '2h', 'tp2_tf': '3h', 'tp3_tf': '4h'},
+        '2h': {'tp1_tf': '3h', 'tp2_tf': '4h', 'tp3_tf': '1d'},
+        '3h': {'tp1_tf': '4h', 'tp2_tf': '1d', 'tp3_tf': '1w'},
         '4h': {'tp1_tf': '1d', 'tp2_tf': '1w', 'tp3_tf': None}
     }
     return mapping.get(entry_tf, {'tp1_tf': '1h', 'tp2_tf': '4h', 'tp3_tf': None})
@@ -481,7 +479,7 @@ def get_atr(symbol, period=14):
 
 def trade_params(symbol, entry, side, entry_tf):
     """
-    NEW: Calculate TP/SL based on swing structure
+    Calculate TP/SL based on swing structure
     """
     # Get swing-based TP/SL
     swing_result = calculate_swing_tp_sl(entry, entry_tf, side, symbol)
@@ -617,7 +615,7 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
     
-    # === STEP 4: APPLY FILTERS (REMOVED CRITICAL FILTERS) ===
+    # === STEP 4: APPLY FILTERS ===
     filter_result, filter_reason = should_accept_signal(
         symbol, chosen_dir, confirming_tfs, tf_details, chosen_tf
     )
@@ -645,7 +643,7 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
     
-    # NEW: Get swing-based TP/SL with entry timeframe
+    # Get swing-based TP/SL with entry timeframe
     tp_sl_result = trade_params(symbol, entry, chosen_dir, chosen_tf)
     if not tp_sl_result:
         skipped_signals += 1
@@ -688,7 +686,7 @@ def analyze_symbol(symbol):
     breakdown_text += f"• Confirming TFs: {', '.join(confirming_tfs)}\n"
     breakdown_text += f"• Confidence: {confidence_pct:.1f}%\n"
     breakdown_text += f"• Market Sentiment: {sentiment.upper()}\n"
-    breakdown_text += f"• Filter Status: NO FILTERS APPLIED\n"
+    breakdown_text += f"• Filter Status: DATA COLLECTION MODE\n"
     breakdown_text += f"• TP System: Swing-based (HTF > Entry TF)"
     
     # === STEP 9: SEND TRADE SIGNAL ===
@@ -702,7 +700,7 @@ def analyze_symbol(symbol):
               f"⚠ Risk: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}%\n"
               f"🧾 TFs confirming: {', '.join(confirming_tfs)}\n"
               f"📈 Market Sentiment: {sentiment.upper()}\n"
-              f"🔍 FILTER: NO FILTERS APPLIED")
+              f"🔍 FILTER: DATA COLLECTION MODE")
     
     # Send both messages
     send_message(header)
@@ -878,19 +876,14 @@ def summary():
 
 # ===== STARTUP =====
 init_csv()
-send_message("✅ SIRTS v10 EXPANDED TIMEFRAMES DEPLOYED\n"
-             "🎯 Target: Test Signal Volume\n"
-             "📈 Timeframes: 5m, 15m, 30m, 1h, 2h, 3h, 4h\n"
+send_message("✅ SIRTS v10 DATA COLLECTION MODE (NO 5m)\n"
+             "🎯 Purpose: Collect maximum signal data for threshold optimization\n"
+             "📈 Timeframes: 15m, 30m, 1h, 2h, 3h, 4h (5m REMOVED - too noisy)\n"
              "📊 Sentiment: CoinGecko Global\n"
-             "🎯 SWING-BASED TP/SL SYSTEM\n"
-             "   • TP from HIGHER timeframe than entry\n"
-             "   • TP1: X+1 TF swing | TP2: X+2 TF swing\n"
-             "   • SL: Entry TF swing + ATR padding\n"
-             "   • TP3: ATR-based (backup)\n"
-             "   • Shows source in breakdown\n"
-             "🔍 NO FILTERS APPLIED - All signals accepted\n"
-             "🚫 2-CRITICAL FILTERS REMOVED\n"
-             "⚠️ MIN CONFIRMING TFS: 2 (increased from 1)")
+             "🎯 SWING-BASED TP/SL SYSTEM ACTIVE\n"
+             "🔍 ALL FILTERS DISABLED FOR DATA COLLECTION\n"
+             "⚠️ THRESHOLDS: MIN_TF_SCORE=25, CONF_MIN_TFS=1, CONFIDENCE_MIN=25\n"
+             "📊 Expected: High signal volume for statistical analysis")
 
 try:
     SYMBOLS = get_top_symbols(TOP_SYMBOLS)
