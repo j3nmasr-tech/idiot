@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SIRTS v10 – Pure Logic Version | Bybit + Detailed Breakdown + 2-CRITICAL FILTERS
-# REQUIREMENT: 1) 1-hour alignment required 2) No adjacent TF contradiction
+# SIRTS v10 – Pure Logic Version | Bybit + Detailed Breakdown + REMOVED 2-CRITICAL FILTERS
+# ADDED TIMEFRAMES: 5m, 2h, 3h
 # Requirements: requests, pandas, numpy
 # BOT_TOKEN and CHAT_ID must be set as environment variables
 
@@ -28,7 +28,8 @@ CAPITAL = 80.0
 LEVERAGE = 30
 COOLDOWN_TIME_DEFAULT = 1800
 
-TIMEFRAMES = ["15m", "30m", "1h", "4h"]
+# ===== EXPANDED TIMEFRAMES =====
+TIMEFRAMES = ["5m", "15m", "30m", "1h", "2h", "3h", "4h"]  # Added 5m, 2h, 3h
 
 # ===== SIGNAL QUALITY WEIGHTS =====
 WEIGHT_BIAS   = 0.25    # EMA bias
@@ -37,10 +38,10 @@ WEIGHT_CRT    = 0.30    # Reversals
 WEIGHT_VOLUME = 0.10    # Volume
 
 # ===== THRESHOLDS =====
-MIN_TF_SCORE  = 50      # Minimum score per timeframe
-CONF_MIN_TFS  = 1       # Minimum timeframe confirmations
-CONFIDENCE_MIN = 30.0   # Minimum overall confidence
-TOP_SYMBOLS = 70        # Number of symbols to monitor
+MIN_TF_SCORE  = 25      # Minimum score per timeframe
+CONF_MIN_TFS  = 1       # INCREASED: Need at least 2 TFs confirming (was 1)
+CONFIDENCE_MIN = 25.0   # Minimum overall confidence
+TOP_SYMBOLS = 60        # Number of symbols to monitor
 
 # ===== BYBIT PUBLIC ENDPOINTS =====
 BYBIT_KLINES = "https://api.bybit.com/v5/market/kline"
@@ -48,7 +49,7 @@ BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
 BYBIT_PRICE = "https://api.bybit.com/v5/market/tickers"
 COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
 
-LOG_CSV = "./sirts_v10_pure.csv"
+LOG_CSV = "./sirts_v10_expanded_tf.csv"
 
 # ===== CACHE =====
 SENTIMENT_CACHE = {"data": None, "timestamp": 0}
@@ -71,106 +72,13 @@ skipped_signals      = 0
 last_heartbeat       = time.time()
 last_summary         = time.time()
 
-# ===== FILTER FUNCTIONS (TWO CRITICAL RULES) =====
-def check_1h_alignment(tf_details, trade_direction):
-    """
-    FILTER 1: 1-hour timeframe MUST be aligned with trade direction
-    - CRT must match direction
-    - Turtle must match direction  
-    - Bias must confirm direction
-    """
-    h1_data = tf_details.get('1h')
-    if not h1_data or not isinstance(h1_data, dict):
-        return False, "No 1h data available"
-    
-    # Check if we have the required indicators
-    if 'crt_bull' not in h1_data or 'crt_bear' not in h1_data:
-        return False, "Missing CRT data in 1h"
-    if 'turtle_bull' not in h1_data or 'turtle_bear' not in h1_data:
-        return False, "Missing Turtle data in 1h"
-    if 'bias' not in h1_data:
-        return False, "Missing Bias data in 1h"
-    
-    # Check CRT matches direction (boolean flags)
-    if trade_direction == "BUY":
-        if not h1_data["crt_bull"]:
-            return False, "1h CRT not bullish"
-    else:  # SELL
-        if not h1_data["crt_bear"]:
-            return False, "1h CRT not bearish"
-    
-    # Check Turtle matches direction (boolean flags)
-    if trade_direction == "BUY":
-        if not h1_data["turtle_bull"]:
-            return False, "1h Turtle not bullish"
-    else:  # SELL
-        if not h1_data["turtle_bear"]:
-            return False, "1h Turtle not bearish"
-    
-    # Check Bias confirms direction
-    bias = h1_data.get("bias", "").lower()
-    if trade_direction == "BUY" and "bull" not in bias:
-        return False, f"1h Bias not bullish: {bias}"
-    if trade_direction == "SELL" and "bear" not in bias:
-        return False, f"1h Bias not bearish: {bias}"
-    
-    return True, "1h alignment passed"
-
-def check_no_adjacent_contradiction(tf_details, trade_direction, entry_tf):
-    """
-    FILTER 2: No adjacent timeframe Turtle contradiction
-    - If BUY: No adjacent TF can have Turtle🐻 (turtle_bear=True)
-    - If SELL: No adjacent TF can have Turtle🐮 (turtle_bull=True)
-    """
-    tf_order = ["15m", "30m", "1h", "4h"]
-    
-    # Find entry TF index
-    if entry_tf not in tf_order:
-        return False, f"Unknown entry TF: {entry_tf}"
-    
-    entry_idx = tf_order.index(entry_tf)
-    
-    # Check previous TF if exists
-    if entry_idx > 0:
-        prev_tf = tf_order[entry_idx - 1]
-        prev_data = tf_details.get(prev_tf)
-        if prev_data and isinstance(prev_data, dict):
-            # Check for Turtle contradiction
-            if trade_direction == "BUY" and prev_data.get("turtle_bear", False):
-                return False, f"{prev_tf} Turtle contradicts (bearish vs BUY)"
-            if trade_direction == "SELL" and prev_data.get("turtle_bull", False):
-                return False, f"{prev_tf} Turtle contradicts (bullish vs SELL)"
-    
-    # Check next TF if exists
-    if entry_idx < len(tf_order) - 1:
-        next_tf = tf_order[entry_idx + 1]
-        next_data = tf_details.get(next_tf)
-        if next_data and isinstance(next_data, dict):
-            # Check for Turtle contradiction
-            if trade_direction == "BUY" and next_data.get("turtle_bear", False):
-                return False, f"{next_tf} Turtle contradicts (bearish vs BUY)"
-            if trade_direction == "SELL" and next_data.get("turtle_bull", False):
-                return False, f"{next_tf} Turtle contradicts (bullish vs SELL)"
-    
-    return True, "No adjacent contradiction"
-
+# ===== FILTER FUNCTIONS (REMOVED 2-CRITICAL RULES) =====
 def should_accept_signal(symbol, chosen_dir, confirming_tfs, tf_details, entry_tf):
     """
-    Apply ONLY TWO CRITICAL FILTERS:
-    1. 1-hour alignment required
-    2. No adjacent timeframe Turtle contradiction
+    NO FILTERS APPLIED - All signals accepted
+    (Removed: 1-hour alignment and adjacent contradiction filters)
     """
-    # FILTER 1: 1-hour alignment
-    filter1_ok, filter1_reason = check_1h_alignment(tf_details, chosen_dir)
-    if not filter1_ok:
-        return False, filter1_reason
-    
-    # FILTER 2: No adjacent contradiction
-    filter2_ok, filter2_reason = check_no_adjacent_contradiction(tf_details, chosen_dir, entry_tf)
-    if not filter2_ok:
-        return False, filter2_reason
-    
-    return True, "Both critical filters passed"
+    return True, "No filters applied - all signals accepted"
 
 def is_first_entry(symbol):
     """Check if this is the first entry for this symbol"""
@@ -235,10 +143,10 @@ def get_top_symbols(n=TOP_SYMBOLS):
     return syms
 
 def interval_to_bybit(interval):
-    m = {"1m":"1", "3m":"3","5m":"5","15m":"15","30m":"30","1h":"60","2h":"120","4h":"240","1d":"D"}
+    m = {"1m":"1", "3m":"3", "5m":"5", "15m":"15", "30m":"30", "1h":"60", "2h":"120", "3h":"180", "4h":"240", "1d":"D"}
     return m.get(interval, interval)
 
-def get_klines(symbol, interval="15m", limit=200):
+def get_klines(symbol, interval="5m", limit=200):
     symbol = sanitize_symbol(symbol)
     if not symbol:
         return None
@@ -420,9 +328,12 @@ def get_swings_for_timeframe(symbol, timeframe):
 def map_higher_tf(entry_tf):
     """Map entry TF to higher timeframes for TP"""
     mapping = {
-        '15m': {'tp1_tf': '30m', 'tp2_tf': '1h', 'tp3_tf': '4h'},
-        '30m': {'tp1_tf': '1h', 'tp2_tf': '4h', 'tp3_tf': '1d'},
-        '1h': {'tp1_tf': '4h', 'tp2_tf': '1d', 'tp3_tf': '1w'},
+        '5m': {'tp1_tf': '15m', 'tp2_tf': '30m', 'tp3_tf': '1h'},    # Added
+        '15m': {'tp1_tf': '30m', 'tp2_tf': '1h', 'tp3_tf': '2h'},    # Updated
+        '30m': {'tp1_tf': '1h', 'tp2_tf': '2h', 'tp3_tf': '3h'},     # Updated
+        '1h': {'tp1_tf': '2h', 'tp2_tf': '3h', 'tp3_tf': '4h'},      # Updated
+        '2h': {'tp1_tf': '3h', 'tp2_tf': '4h', 'tp3_tf': '1d'},      # Added
+        '3h': {'tp1_tf': '4h', 'tp2_tf': '1d', 'tp3_tf': '1w'},      # Added
         '4h': {'tp1_tf': '1d', 'tp2_tf': '1w', 'tp3_tf': None}
     }
     return mapping.get(entry_tf, {'tp1_tf': '1h', 'tp2_tf': '4h', 'tp3_tf': None})
@@ -706,7 +617,7 @@ def analyze_symbol(symbol):
         skipped_signals += 1
         return False
     
-    # === STEP 4: APPLY 2-CRITICAL FILTERS ===
+    # === STEP 4: APPLY FILTERS (REMOVED CRITICAL FILTERS) ===
     filter_result, filter_reason = should_accept_signal(
         symbol, chosen_dir, confirming_tfs, tf_details, chosen_tf
     )
@@ -777,7 +688,7 @@ def analyze_symbol(symbol):
     breakdown_text += f"• Confirming TFs: {', '.join(confirming_tfs)}\n"
     breakdown_text += f"• Confidence: {confidence_pct:.1f}%\n"
     breakdown_text += f"• Market Sentiment: {sentiment.upper()}\n"
-    breakdown_text += f"• Filter Status: PASSED (2-critical filters) ✓\n"
+    breakdown_text += f"• Filter Status: NO FILTERS APPLIED\n"
     breakdown_text += f"• TP System: Swing-based (HTF > Entry TF)"
     
     # === STEP 9: SEND TRADE SIGNAL ===
@@ -791,7 +702,7 @@ def analyze_symbol(symbol):
               f"⚠ Risk: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}%\n"
               f"🧾 TFs confirming: {', '.join(confirming_tfs)}\n"
               f"📈 Market Sentiment: {sentiment.upper()}\n"
-              f"🔍 FILTER: PASSED (2-critical filters) ✓")
+              f"🔍 FILTER: NO FILTERS APPLIED")
     
     # Send both messages
     send_message(header)
@@ -967,20 +878,19 @@ def summary():
 
 # ===== STARTUP =====
 init_csv()
-send_message("✅ SIRTS v10 PURE LOGIC DEPLOYED\n"
-             "🎯 Target: 85%+ Accuracy\n"
-             "📈 Timeframes: 15m, 30m, 1h, 4h\n"
+send_message("✅ SIRTS v10 EXPANDED TIMEFRAMES DEPLOYED\n"
+             "🎯 Target: Test Signal Volume\n"
+             "📈 Timeframes: 5m, 15m, 30m, 1h, 2h, 3h, 4h\n"
              "📊 Sentiment: CoinGecko Global\n"
-             "🎯 NEW: SWING-BASED TP/SL SYSTEM\n"
+             "🎯 SWING-BASED TP/SL SYSTEM\n"
              "   • TP from HIGHER timeframe than entry\n"
              "   • TP1: X+1 TF swing | TP2: X+2 TF swing\n"
              "   • SL: Entry TF swing + ATR padding\n"
              "   • TP3: ATR-based (backup)\n"
              "   • Shows source in breakdown\n"
-             "🔍 2-CRITICAL FILTERS:\n"
-             "   1️⃣ 1-HOUR ALIGNMENT REQUIRED\n"
-             "   2️⃣ NO ADJACENT TF CONTRADICTION\n"
-             "🚫 REJECTS: Trades without 1h support or with adjacent contradictions")
+             "🔍 NO FILTERS APPLIED - All signals accepted\n"
+             "🚫 2-CRITICAL FILTERS REMOVED\n"
+             "⚠️ MIN CONFIRMING TFS: 2 (increased from 1)")
 
 try:
     SYMBOLS = get_top_symbols(TOP_SYMBOLS)
