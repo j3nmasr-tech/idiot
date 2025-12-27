@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# SIRTS v10 – DATA COLLECTION MODE (NO 5m) with Entry TF Volume Filter & Strategic TP/SL
-# REMOVED 5m TIMEFRAME - TOO NOISY FOR SWING STRATEGY
+# SIRTS v10 – DATA COLLECTION MODE (NO 5m) with PROFESSIONAL TP/SL RULES
+# UPDATED: STRICT HTF SWINGS FOR SL, SCALED TPs AS PER YOUR RULES
 # Requirements: requests, pandas, numpy
 # BOT_TOKEN and CHAT_ID must be set as environment variables
 
@@ -49,7 +49,7 @@ BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
 BYBIT_PRICE = "https://api.bybit.com/v5/market/tickers"
 COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
 
-LOG_CSV = "./sirts_v10_no_5m.csv"
+LOG_CSV = "./sirts_v10_professional_tpsl.csv"
 
 # ===== CACHE =====
 SENTIMENT_CACHE = {"data": None, "timestamp": 0}
@@ -72,12 +72,32 @@ skipped_signals      = 0
 last_heartbeat       = time.time()
 last_summary         = time.time()
 
-# ===== FILTER FUNCTIONS (DATA COLLECTION MODE with Entry TF Volume Filter) =====
+# ===== PROFESSIONAL TP/SL MAPPINGS =====
+# 🛑 STOP LOSS MAPPING (HTF Swings ONLY)
+SL_TF_MAPPING = {
+    '15m': '1h',    # SL from 1H swings
+    '30m': '1h',    # SL from 1H or 2H (we'll use 1H first, fallback to 2H)
+    '1h': '2h',     # SL from 2H swings
+    '2h': '3h',     # SL from 3H swings
+    '3h': '4h',     # SL from 4H swings
+    '4h': '1d'      # SL from Daily swings
+}
+
+# 🎯 TAKE PROFIT MAPPING
+TP_MAPPING = {
+    '15m': {'tp1': '30m', 'tp2': '1h', 'tp3': '2h'},
+    '30m': {'tp1': '1h', 'tp2': '2h', 'tp3': '3h'},
+    '1h': {'tp1': '2h', 'tp2': '3h', 'tp3': '4h'},
+    '2h': {'tp1': '3h', 'tp2': '4h', 'tp3': '1d'},
+    '3h': {'tp1': '4h', 'tp2': '1d', 'tp3': '1w'},
+    '4h': {'tp1': '1d', 'tp2': '1w', 'tp3': None}  # TP3 will be R:R only
+}
+
+# ===== FILTER FUNCTIONS =====
 def should_accept_signal(symbol, chosen_dir, confirming_tfs, tf_details, entry_tf):
     """
     DATA COLLECTION: Accept signals only if Entry TF has Volume confirmation
     """
-    # Check if Entry TF has volume confirmation
     if entry_tf in tf_details and isinstance(tf_details[entry_tf], dict):
         if not tf_details[entry_tf]["volume_ok"]:
             return False, "ENTRY_TF_VOLUME_REQUIRED"
@@ -147,7 +167,7 @@ def get_top_symbols(n=TOP_SYMBOLS):
     return syms
 
 def interval_to_bybit(interval):
-    m = {"15m":"15", "30m":"30", "1h":"60", "2h":"120", "3h":"180", "4h":"240", "1d":"D"}
+    m = {"15m":"15", "30m":"30", "1h":"60", "2h":"120", "3h":"180", "4h":"240", "1d":"D", "1w":"W"}
     return m.get(interval, interval)
 
 def get_klines(symbol, interval="15m", limit=200):
@@ -190,6 +210,324 @@ def get_price(symbol):
             except:
                 return None
     return None
+
+# ===== SUPPORTING FUNCTIONS =====
+def get_atr(symbol, period=14):
+    """Get ATR for volatility measurement"""
+    symbol = sanitize_symbol(symbol)
+    if not symbol:
+        return None
+    df = get_klines(symbol, "1h", period+1)
+    if df is None or len(df) < period+1:
+        return None
+    # Clean data
+    df = df.dropna()
+    if len(df) < period+1:
+        return None
+    
+    h = df["high"].values
+    l = df["low"].values
+    c = df["close"].values
+    trs = []
+    for i in range(1, len(df)):
+        tr1 = h[i] - l[i]
+        tr2 = abs(h[i] - c[i-1])
+        tr3 = abs(l[i] - c[i-1])
+        trs.append(max(tr1, tr2, tr3))
+    if not trs:
+        return None
+    atr_value = float(np.mean(trs))
+    return max(atr_value, 1e-8)
+
+def pos_size_units(entry, sl):
+    risk_percent = BASE_RISK
+    risk_usd     = CAPITAL * risk_percent
+    sl_dist      = abs(entry - sl)
+    
+    # Prevent division by zero and too tight stops
+    if sl_dist <= 0:
+        return 0.0, 0.0, 0.0, risk_percent
+        
+    min_sl = max(entry * 0.0015, 1e-8)
+    if sl_dist < min_sl:
+        return 0.0, 0.0, 0.0, risk_percent
+    
+    units = risk_usd / sl_dist
+    exposure = units * entry
+    max_exposure = CAPITAL * 0.20
+    
+    if exposure > max_exposure and exposure > 0:
+        units = max_exposure / entry
+        exposure = units * entry
+    
+    margin_req = exposure / LEVERAGE
+    if margin_req < 0.25:
+        return 0.0, 0.0, 0.0, risk_percent
+    
+    return round(units, 8), round(margin_req, 6), round(exposure, 6), risk_percent
+
+# ===== SIMPLIFIED SWING DETECTION =====
+def detect_major_swings(df, direction, lookback_candles=50):
+    """
+    Find MAJOR swing levels in HTF (simple, robust approach)
+    Returns: (strongest_support, strongest_resistance)
+    """
+    if df is None or len(df) < lookback_candles:
+        return None, None
+    
+    # Clean data
+    df = df.dropna()
+    if len(df) < lookback_candles:
+        return None, None
+    
+    # Use recent data for current market structure
+    recent_df = df.iloc[-lookback_candles:]
+    
+    # Find clear swing highs and lows using simple fractal logic
+    swing_highs = []
+    swing_lows = []
+    
+    for i in range(2, len(recent_df)-2):
+        current_low = recent_df['low'].iloc[i]
+        current_high = recent_df['high'].iloc[i]
+        
+        # Check for swing low (local minimum)
+        if (current_low < recent_df['low'].iloc[i-1] and 
+            current_low < recent_df['low'].iloc[i-2] and
+            current_low < recent_df['low'].iloc[i+1] and
+            current_low < recent_df['low'].iloc[i+2]):
+            
+            # Price must have moved AWAY from this low significantly
+            future_bars = min(10, len(recent_df) - i - 1)
+            if future_bars > 0:
+                avg_future_close = recent_df['close'].iloc[i+1:i+1+future_bars].mean()
+                if avg_future_close > current_low * 1.01:  # At least 1% move away
+                    swing_lows.append(current_low)
+        
+        # Check for swing high (local maximum)
+        if (current_high > recent_df['high'].iloc[i-1] and 
+            current_high > recent_df['high'].iloc[i-2] and
+            current_high > recent_df['high'].iloc[i+1] and
+            current_high > recent_df['high'].iloc[i+2]):
+            
+            future_bars = min(10, len(recent_df) - i - 1)
+            if future_bars > 0:
+                avg_future_close = recent_df['close'].iloc[i+1:i+1+future_bars].mean()
+                if avg_future_close < current_high * 0.99:  # At least 1% move away
+                    swing_highs.append(current_high)
+    
+    # Get the most recent and significant swings
+    if swing_lows:
+        strongest_support = max(swing_lows[-3:]) if len(swing_lows) >= 3 else swing_lows[-1]
+    else:
+        strongest_support = None
+    
+    if swing_highs:
+        strongest_resistance = min(swing_highs[-3:]) if len(swing_highs) >= 3 else swing_highs[-1]
+    else:
+        strongest_resistance = None
+    
+    return strongest_support, strongest_resistance
+
+def get_strategic_sl(entry_price, entry_tf, direction, symbol):
+    """
+    🛑 PROFESSIONAL SL RULE: SL from AT LEAST ONE TF HIGHER than entry
+    """
+    sl_tf = SL_TF_MAPPING.get(entry_tf, '1h')
+    sl_df = None
+    
+    # Special handling for 30m -> try 1h first, then 2h
+    if entry_tf == '30m':
+        sl_df = get_klines(symbol, '1h', limit=100)
+        if sl_df is None or len(sl_df) < 50:
+            sl_tf = '2h'
+            sl_df = get_klines(symbol, '2h', limit=100)
+    else:
+        sl_df = get_klines(symbol, sl_tf, limit=100)
+    
+    # Handle case where sl_df is still None
+    if sl_df is None or len(sl_df) < 30:
+        # Fallback to volatility-based but with MINIMUM distance
+        atr = get_atr(symbol)
+        if atr is None:
+            atr = entry_price * 0.015
+        
+        if direction == "BUY":
+            sl = entry_price - max(atr * 1.5, entry_price * 0.01)  # Min 1% stop
+        else:
+            sl = entry_price + max(atr * 1.5, entry_price * 0.01)  # Min 1% stop
+        return sl, f"Volatility fallback (HTF data missing)"
+    
+    support, resistance = detect_major_swings(sl_df, direction)
+    
+    if direction == "BUY":
+        # For BUY: SL below nearest MAJOR support on HTF
+        if support is not None and support < entry_price:
+            # Place SL 1-2% below the HTF support
+            sl_buffer = support * 0.015  # 1.5% buffer
+            sl = support - sl_buffer
+            return sl, f"HTF {sl_tf} swing support"
+        else:
+            # No clear support below, use volatility with MINIMUM distance
+            atr = get_atr(symbol)
+            if atr is None:
+                atr = entry_price * 0.02
+            sl = entry_price - max(atr * 1.5, entry_price * 0.015)  # Minimum 1.5%
+            return sl, f"No HTF support (volatility stop)"
+    else:  # SELL
+        # For SELL: SL above nearest MAJOR resistance on HTF
+        if resistance is not None and resistance > entry_price:
+            sl_buffer = resistance * 0.015  # 1.5% buffer
+            sl = resistance + sl_buffer
+            return sl, f"HTF {sl_tf} swing resistance"
+        else:
+            atr = get_atr(symbol)
+            if atr is None:
+                atr = entry_price * 0.02
+            sl = entry_price + max(atr * 1.5, entry_price * 0.015)  # Minimum 1.5%
+            return sl, f"No HTF resistance (volatility stop)"
+
+def get_strategic_tps(entry_price, entry_tf, direction, sl, symbol):
+    """
+    🎯 PROFESSIONAL TP RULES:
+    TP1 = Market Reaction (next higher TF)
+    TP2 = Market Structure (TF after that)
+    TP3 = Market Expansion (runner)
+    """
+    tp_config = TP_MAPPING.get(entry_tf, {'tp1': '1h', 'tp2': '4h', 'tp3': None})
+    sl_distance = abs(entry_price - sl)
+    
+    # TP1: Market Reaction (next TF)
+    tp1_tf = tp_config['tp1']
+    tp1_df = get_klines(symbol, tp1_tf, limit=100)
+    
+    if tp1_df is not None:
+        support, resistance = detect_major_swings(tp1_df, direction)
+        
+        if direction == "BUY":
+            if resistance is not None and resistance > entry_price:
+                tp1 = resistance
+                tp1_source = f"{tp1_tf} reaction swing"
+            else:
+                # 1.5:1 R:R minimum for TP1
+                tp1 = entry_price + (sl_distance * 1.5)
+                tp1_source = f"1.5:1 R:R (no {tp1_tf} swing)"
+        else:  # SELL
+            if support is not None and support < entry_price:
+                tp1 = support
+                tp1_source = f"{tp1_tf} reaction swing"
+            else:
+                tp1 = entry_price - (sl_distance * 1.5)
+                tp1_source = f"1.5:1 R:R (no {tp1_tf} swing)"
+    else:
+        tp1 = entry_price + (sl_distance * 1.5) if direction == "BUY" else entry_price - (sl_distance * 1.5)
+        tp1_source = f"1.5:1 R:R (no {tp1_tf} data)"
+    
+    # TP2: Market Structure (stronger swing)
+    tp2_tf = tp_config['tp2']
+    if tp2_tf:
+        tp2_df = get_klines(symbol, tp2_tf, limit=100)
+        
+        if tp2_df is not None:
+            support, resistance = detect_major_swings(tp2_df, direction)
+            
+            if direction == "BUY":
+                if resistance is not None and resistance > tp1:
+                    tp2 = resistance
+                    tp2_source = f"{tp2_tf} structure swing"
+                else:
+                    # 2.5:1 R:R for TP2
+                    tp2 = entry_price + (sl_distance * 2.5)
+                    tp2_source = f"2.5:1 R:R (no {tp2_tf} swing)"
+            else:  # SELL
+                if support is not None and support < tp1:
+                    tp2 = support
+                    tp2_source = f"{tp2_tf} structure swing"
+                else:
+                    tp2 = entry_price - (sl_distance * 2.5)
+                    tp2_source = f"2.5:1 R:R (no {tp2_tf} swing)"
+        else:
+            tp2 = entry_price + (sl_distance * 2.5) if direction == "BUY" else entry_price - (sl_distance * 2.5)
+            tp2_source = f"2.5:1 R:R (no {tp2_tf} data)"
+    else:
+        tp2 = entry_price + (sl_distance * 2.5) if direction == "BUY" else entry_price - (sl_distance * 2.5)
+        tp2_source = "2.5:1 R:R (no higher TF)"
+    
+    # TP3: Market Expansion / Runner
+    # Always R:R based for expansion
+    tp3 = entry_price + (sl_distance * 4.0) if direction == "BUY" else entry_price - (sl_distance * 4.0)
+    tp3_source = "4.0:1 R:R (runner)"
+    
+    # Ensure TPs are in correct order
+    if direction == "BUY":
+        if tp1 >= tp2:
+            tp2 = tp1 * 1.015  # Add 1.5% if TP1 >= TP2
+            tp2_source = "Adjusted: TP1 >= TP2"
+        if tp2 >= tp3:
+            tp3 = tp2 * 1.025  # Add 2.5% if TP2 >= TP3
+            tp3_source = "Adjusted: TP2 >= TP3"
+    else:  # SELL
+        if tp1 <= tp2:
+            tp2 = tp1 * 0.985  # Subtract 1.5% if TP1 <= TP2
+            tp2_source = "Adjusted: TP1 <= TP2"
+        if tp2 <= tp3:
+            tp3 = tp2 * 0.975  # Subtract 2.5% if TP2 <= TP3
+            tp3_source = "Adjusted: TP2 <= TP3"
+    
+    return tp1, tp2, tp3, tp1_source, tp2_source, tp3_source
+
+def trade_params(symbol, entry, side, entry_tf):
+    """
+    Calculate TP/SL based on PROFESSIONAL rules
+    """
+    # Get SL from HTF (NON-NEGOTIABLE rule)
+    sl, sl_source = get_strategic_sl(entry, entry_tf, side, symbol)
+    
+    # Get TPs based on reaction/structure/expansion
+    tp1, tp2, tp3, tp1_source, tp2_source, tp3_source = get_strategic_tps(
+        entry, entry_tf, side, sl, symbol
+    )
+    
+    # Ensure SL distance is reasonable (not too tight, not too loose)
+    if entry > 0:
+        sl_distance_pct = abs(entry - sl) / entry
+    else:
+        sl_distance_pct = 0
+    
+    if sl_distance_pct < 0.008:  # Minimum 0.8% stop
+        if side == "BUY":
+            sl = entry * 0.992
+        else:
+            sl = entry * 1.008
+        sl_source = f"Adjusted (min 0.8%): {sl_source}"
+    
+    if sl_distance_pct > 0.05:  # Maximum 5% stop
+        if side == "BUY":
+            sl = entry * 0.95
+        else:
+            sl = entry * 1.05
+        sl_source = f"Adjusted (max 5%): {sl_source}"
+    
+    # Round values
+    sl = round(sl, 8)
+    tp1 = round(tp1, 8)
+    tp2 = round(tp2, 8)
+    tp3 = round(tp3, 8)
+    
+    tp_sources = {
+        'tp1': tp1_source,
+        'tp2': tp2_source,
+        'tp3': tp3_source,
+        'sl': sl_source
+    }
+    
+    higher_tfs = {
+        'tp1_tf': TP_MAPPING.get(entry_tf, {}).get('tp1', '1h'),
+        'tp2_tf': TP_MAPPING.get(entry_tf, {}).get('tp2', '4h'),
+        'tp3_tf': 'runner'
+    }
+    
+    return sl, tp1, tp2, tp3, tp_sources, higher_tfs
 
 # ===== SENTIMENT =====
 def get_coingecko_global():
@@ -283,317 +621,6 @@ def volume_ok(df):
         return False
     current = df["volume"].iloc[-1]
     return current > ma * 1.3
-
-# ===== STRATEGIC SWING DETECTION & ENHANCED TP/SL FUNCTIONS =====
-def find_strategic_swings(df, current_price, direction, min_swing_strength=3):
-    """
-    Find MAJOR swing levels that matter, not just nearest ones.
-    
-    Parameters:
-    - min_swing_strength: How many candles the swing should dominate (3-5)
-    
-    Returns: (list_of_supports, list_of_resistances) sorted by importance
-    """
-    if len(df) < 50:
-        return [], []
-    
-    supports = []
-    resistances = []
-    
-    # We'll use fractal detection for major swings
-    for i in range(2, len(df)-2):
-        # Check for bullish fractal (potential support)
-        if (df['low'].iloc[i] < df['low'].iloc[i-2] and
-            df['low'].iloc[i] < df['low'].iloc[i-1] and
-            df['low'].iloc[i] < df['low'].iloc[i+1] and
-            df['low'].iloc[i] < df['low'].iloc[i+2]):
-            
-            # Check if this low held for N candles
-            holding_candles = 0
-            for j in range(min_swing_strength):
-                if i+j+1 < len(df):
-                    if df['low'].iloc[i] <= df['close'].iloc[i+j+1] <= df['low'].iloc[i] * 1.02:
-                        holding_candles += 1
-            
-            if holding_candles >= min_swing_strength:
-                supports.append({
-                    'price': df['low'].iloc[i],
-                    'strength': holding_candles,
-                    'age': len(df) - i  # Older swings might be more important
-                })
-        
-        # Check for bearish fractal (potential resistance)
-        if (df['high'].iloc[i] > df['high'].iloc[i-2] and
-            df['high'].iloc[i] > df['high'].iloc[i-1] and
-            df['high'].iloc[i] > df['high'].iloc[i+1] and
-            df['high'].iloc[i] > df['high'].iloc[i+2]):
-            
-            # Check if this high held for N candles
-            holding_candles = 0
-            for j in range(min_swing_strength):
-                if i+j+1 < len(df):
-                    if df['high'].iloc[i] * 0.98 <= df['close'].iloc[i+j+1] <= df['high'].iloc[i]:
-                        holding_candles += 1
-            
-            if holding_candles >= min_swing_strength:
-                resistances.append({
-                    'price': df['high'].iloc[i],
-                    'strength': holding_candles,
-                    'age': len(df) - i
-                })
-    
-    # Sort by strength (number of candles held) then by age
-    supports.sort(key=lambda x: (x['strength'], x['age']), reverse=True)
-    resistances.sort(key=lambda x: (x['strength'], x['age']), reverse=True)
-    
-    # Return only top 3 most significant levels
-    top_supports = [s['price'] for s in supports[:3]]
-    top_resistances = [r['price'] for r in resistances[:3]]
-    
-    return top_supports, top_resistances
-
-def select_strategic_level(levels, entry_price, direction, min_distance_pct=0.005, max_distance_pct=0.05):
-    """
-    Select the BEST strategic level for TP/SL based on:
-    1. Logical distance from entry
-    2. Strength of the level
-    3. Not too close, not too far
-    """
-    if not levels:
-        return None
-    
-    suitable_levels = []
-    
-    for level in levels:
-        distance_pct = abs(level - entry_price) / entry_price
-        
-        # Check if level is in correct direction
-        if direction == "BUY":
-            if level > entry_price and min_distance_pct <= distance_pct <= max_distance_pct:
-                suitable_levels.append((level, distance_pct))
-        else:  # SELL
-            if level < entry_price and min_distance_pct <= distance_pct <= max_distance_pct:
-                suitable_levels.append((level, distance_pct))
-    
-    if not suitable_levels:
-        return None
-    
-    # Pick the level with the "Goldilocks" distance (not too close, not too far)
-    # Aim for 1.5-3% for TP1, 3-6% for TP2
-    suitable_levels.sort(key=lambda x: abs(x[1] - 0.02))  # Target ~2% distance
-    
-    return suitable_levels[0][0]
-
-def map_higher_tf(entry_tf):
-    """Map entry TF to higher timeframes for TP"""
-    mapping = {
-        '15m': {'tp1_tf': '30m', 'tp2_tf': '1h', 'tp3_tf': '2h'},
-        '30m': {'tp1_tf': '1h', 'tp2_tf': '2h', 'tp3_tf': '3h'},
-        '1h': {'tp1_tf': '2h', 'tp2_tf': '3h', 'tp3_tf': '4h'},
-        '2h': {'tp1_tf': '3h', 'tp2_tf': '4h', 'tp3_tf': '1d'},
-        '3h': {'tp1_tf': '4h', 'tp2_tf': '1d', 'tp3_tf': '1w'},
-        '4h': {'tp1_tf': '1d', 'tp2_tf': '1w', 'tp3_tf': None}
-    }
-    return mapping.get(entry_tf, {'tp1_tf': '1h', 'tp2_tf': '4h', 'tp3_tf': None})
-
-def get_atr(symbol, period=14):
-    symbol = sanitize_symbol(symbol)
-    if not symbol:
-        return None
-    df = get_klines(symbol, "1h", period+1)
-    if df is None or len(df) < period+1:
-        return None
-    h = df["high"].values
-    l = df["low"].values
-    c = df["close"].values
-    trs = []
-    for i in range(1, len(df)):
-        trs.append(max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1])))
-    if not trs:
-        return None
-    return max(float(np.mean(trs)), 1e-8)
-
-def calculate_strategic_tp_sl(entry_price, entry_tf, direction, symbol):
-    """
-    Enhanced TP/SL using strategic swing levels
-    """
-    higher_tfs = map_higher_tf(entry_tf)
-    tp_sources = {}
-    
-    # Get volatility for sensible defaults
-    atr = get_atr(symbol)
-    if atr is None:
-        atr = entry_price * 0.005
-    
-    # ===== STOP LOSS =====
-    # Look for major support/resistance BEHIND us (in the wrong direction)
-    entry_df = get_klines(symbol, entry_tf, limit=100)
-    
-    if direction == "BUY":
-        # For BUY: SL below entry - find major support levels below
-        if entry_df is not None:
-            supports, _ = find_strategic_swings(entry_df, entry_price, direction)
-            # Filter for supports BELOW entry
-            below_supports = [s for s in supports if s < entry_price]
-            
-            if below_supports:
-                # Take the strongest support below entry
-                strongest_below = max(below_supports)
-                # Place SL just below it (1.5% below or half ATR, whichever is smaller)
-                sl_padding = min(strongest_below * 0.015, atr * 0.5)
-                sl = strongest_below - sl_padding
-                sl_source = f"{entry_tf} major swing"
-            else:
-                # No major support below - use volatility-based stop
-                sl = entry_price - (atr * 1.7)
-                sl_source = "volatility stop"
-        else:
-            sl = entry_price - (atr * 1.7)
-            sl_source = "volatility stop"
-    
-    else:  # SELL
-        # For SELL: SL above entry - find major resistance levels above
-        if entry_df is not None:
-            _, resistances = find_strategic_swings(entry_df, entry_price, direction)
-            # Filter for resistances ABOVE entry
-            above_resistances = [r for r in resistances if r > entry_price]
-            
-            if above_resistances:
-                # Take the strongest resistance above entry
-                strongest_above = min(above_resistances)
-                # Place SL just above it
-                sl_padding = min(strongest_above * 0.015, atr * 0.5)
-                sl = strongest_above + sl_padding
-                sl_source = f"{entry_tf} major swing"
-            else:
-                # No major resistance above - use volatility-based stop
-                sl = entry_price + (atr * 1.7)
-                sl_source = "volatility stop"
-        else:
-            sl = entry_price + (atr * 1.7)
-            sl_source = "volatility stop"
-    
-    # Ensure SL isn't too tight or too loose
-    if direction == "BUY":
-        min_sl = entry_price * 0.99  # Max 1% stop
-        max_sl = entry_price * 0.95  # Min 5% stop
-        sl = max(min_sl, min(sl, max_sl))
-    else:
-        min_sl = entry_price * 1.01  # Max 1% stop
-        max_sl = entry_price * 1.05  # Min 5% stop
-        sl = min(max_sl, max(sl, min_sl))
-    
-    # ===== TAKE PROFIT 1 =====
-    # Look for strategic levels in the NEXT higher timeframe
-    tp1_df = get_klines(symbol, higher_tfs['tp1_tf'], limit=100)
-    
-    if tp1_df is not None:
-        if direction == "BUY":
-            _, tp1_resistances = find_strategic_swings(tp1_df, entry_price, direction)
-            tp1 = select_strategic_level(tp1_resistances, entry_price, "BUY", 
-                                        min_distance_pct=0.008, max_distance_pct=0.04)
-            if tp1:
-                tp_sources['tp1'] = f"{higher_tfs['tp1_tf']} strategic swing"
-            else:
-                # No good swing level - use R:R based on SL
-                sl_distance = abs(entry_price - sl)
-                tp1 = entry_price + (sl_distance * 1.8)  # 1:1.8 R:R minimum
-                tp_sources['tp1'] = f"R:R based (1.8:1)"
-        else:  # SELL
-            tp1_supports, _ = find_strategic_swings(tp1_df, entry_price, direction)
-            tp1 = select_strategic_level(tp1_supports, entry_price, "SELL",
-                                        min_distance_pct=0.008, max_distance_pct=0.04)
-            if tp1:
-                tp_sources['tp1'] = f"{higher_tfs['tp1_tf']} strategic swing"
-            else:
-                sl_distance = abs(entry_price - sl)
-                tp1 = entry_price - (sl_distance * 1.8)
-                tp_sources['tp1'] = f"R:R based (1.8:1)"
-    else:
-        # Fallback to good R:R
-        sl_distance = abs(entry_price - sl)
-        if direction == "BUY":
-            tp1 = entry_price + (sl_distance * 1.8)
-        else:
-            tp1 = entry_price - (sl_distance * 1.8)
-        tp_sources['tp1'] = "R:R fallback (1.8:1)"
-    
-    # ===== TAKE PROFIT 2 =====
-    # Look for even stronger levels in the NEXT+1 timeframe
-    tp2_df = get_klines(symbol, higher_tfs['tp2_tf'], limit=100)
-    
-    if tp2_df is not None:
-        if direction == "BUY":
-            _, tp2_resistances = find_strategic_swings(tp2_df, tp1, direction)
-            tp2 = select_strategic_level(tp2_resistances, tp1, "BUY",
-                                        min_distance_pct=0.015, max_distance_pct=0.08)
-            if tp2 and tp2 > tp1:
-                tp_sources['tp2'] = f"{higher_tfs['tp2_tf']} strategic swing"
-            else:
-                tp2 = entry_price + (abs(entry_price - sl) * 2.8)  # 1:2.8 R:R
-                tp_sources['tp2'] = f"R:R based (2.8:1)"
-        else:  # SELL
-            tp2_supports, _ = find_strategic_swings(tp2_df, tp1, direction)
-            tp2 = select_strategic_level(tp2_supports, tp1, "SELL",
-                                        min_distance_pct=0.015, max_distance_pct=0.08)
-            if tp2 and tp2 < tp1:
-                tp_sources['tp2'] = f"{higher_tfs['tp2_tf']} strategic swing"
-            else:
-                tp2 = entry_price - (abs(entry_price - sl) * 2.8)
-                tp_sources['tp2'] = f"R:R based (2.8:1)"
-    else:
-        sl_distance = abs(entry_price - sl)
-        if direction == "BUY":
-            tp2 = entry_price + (sl_distance * 2.8)
-        else:
-            tp2 = entry_price - (sl_distance * 2.8)
-        tp_sources['tp2'] = "R:R fallback (2.8:1)"
-    
-    # ===== TAKE PROFIT 3 =====
-    # Aggressive target: 1:4 R:R or major weekly swing
-    sl_distance = abs(entry_price - sl)
-    if direction == "BUY":
-        tp3 = entry_price + (sl_distance * 4.0)
-    else:
-        tp3 = entry_price - (sl_distance * 4.0)
-    tp_sources['tp3'] = "Aggressive R:R (4.0:1)"
-    
-    # Round and return
-    sl = round(sl, 8)
-    tp1 = round(tp1, 8)
-    tp2 = round(tp2, 8)
-    tp3 = round(tp3, 8)
-    tp_sources['sl'] = sl_source
-    
-    return sl, tp1, tp2, tp3, tp_sources, higher_tfs
-
-def trade_params(symbol, entry, side, entry_tf):
-    """
-    Calculate TP/SL based on strategic swing levels
-    """
-    # Get strategic TP/SL with entry timeframe
-    swing_result = calculate_strategic_tp_sl(entry, entry_tf, side, symbol)
-    sl, tp1, tp2, tp3, tp_sources, higher_tfs = swing_result
-    
-    return sl, tp1, tp2, tp3, tp_sources, higher_tfs
-
-def pos_size_units(entry, sl):
-    risk_percent = BASE_RISK
-    risk_usd     = CAPITAL * risk_percent
-    sl_dist      = abs(entry - sl)
-    min_sl = max(entry * 0.0015, 1e-8)
-    if sl_dist < min_sl:
-        return 0.0, 0.0, 0.0, risk_percent
-    units = risk_usd / sl_dist
-    exposure = units * entry
-    max_exposure = CAPITAL * 0.20
-    if exposure > max_exposure and exposure > 0:
-        units = max_exposure / entry
-        exposure = units * entry
-    margin_req = exposure / LEVERAGE
-    if margin_req < 0.25:
-        return 0.0, 0.0, 0.0, risk_percent
-    return round(units,8), round(margin_req,6), round(exposure,6), risk_percent
 
 # ===== LOGGING =====
 def init_csv():
@@ -763,12 +790,12 @@ def analyze_symbol(symbol):
                 breakdown_text += f"  Turtle: {turtle_icon}\n"
     
     # Add TP/SL sources to breakdown
-    breakdown_text += f"\n🎯 TP/SL SOURCES:\n"
+    breakdown_text += f"\n🎯 PROFESSIONAL TP/SL SYSTEM:\n"
     breakdown_text += f"• Entry TF: {chosen_tf}\n"
+    breakdown_text += f"• SL Source: {tp_sources.get('sl', 'Unknown')}\n"
     breakdown_text += f"• TP1 ({higher_tfs['tp1_tf']}): {tp_sources.get('tp1', 'Unknown')}\n"
     breakdown_text += f"• TP2 ({higher_tfs['tp2_tf']}): {tp_sources.get('tp2', 'Unknown')}\n"
-    breakdown_text += f"• TP3: {tp_sources.get('tp3', 'ATR-based')}\n"
-    breakdown_text += f"• SL: {tp_sources.get('sl', 'Unknown')}\n"
+    breakdown_text += f"• TP3: {tp_sources.get('tp3', 'R:R based')}\n"
     
     breakdown_text += f"\n🎯 SIGNAL SUMMARY:\n"
     breakdown_text += f"• Direction: {chosen_dir}\n"
@@ -777,14 +804,14 @@ def analyze_symbol(symbol):
     breakdown_text += f"• Confidence: {confidence_pct:.1f}%\n"
     breakdown_text += f"• Market Sentiment: {sentiment.upper()}\n"
     breakdown_text += f"• Filter Status: {filter_reason}\n"
-    breakdown_text += f"• TP System: Strategic Swing-based (HTF > Entry TF)"
+    breakdown_text += f"• TP System: HTF Swing-based (PROFESSIONAL RULES)"
     
     # === STEP 9: SEND TRADE SIGNAL ===
     header = (f"✅ {chosen_dir} {symbol}\n"
               f"💵 Entry: {entry} | TF: {chosen_tf}\n"
               f"🎯 TP1: {tp1} ({tp_sources.get('tp1', 'Unknown')})\n"
               f"🎯 TP2: {tp2} ({tp_sources.get('tp2', 'Unknown')})\n"
-              f"🎯 TP3: {tp3} ({tp_sources.get('tp3', 'ATR-based')})\n"
+              f"🎯 TP3: {tp3} ({tp_sources.get('tp3', 'R:R based')})\n"
               f"🛑 SL: {sl} ({tp_sources.get('sl', 'Unknown')})\n"
               f"💰 Units:{units} | Margin≈${margin} | Exposure≈${exposure}\n"
               f"⚠ Risk: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}%\n"
@@ -959,21 +986,25 @@ def summary():
                        f"💵 Capital: ${CAPITAL}\n"
                        f"🎚️ Leverage: {LEVERAGE}x\n"
                        f"⚠️ Risk per Trade: {BASE_RISK*100:.1f}%\n"
-                       f"🎯 TP System: Strategic Swing-based (HTF > Entry TF)")
+                       f"🎯 TP System: HTF Swing-based (PROFESSIONAL RULES)")
     
     send_message(detailed_summary)
     print(f"📊 Daily Summary. Accuracy: {acc:.1f}%")
 
 # ===== STARTUP =====
 init_csv()
-send_message("✅ SIRTS v10 with Strategic TP/SL System\n"
+send_message("✅ SIRTS v10 with PROFESSIONAL TP/SL SYSTEM\n"
              "🎯 Purpose: Collect filtered signal data for threshold optimization\n"
              "📈 Timeframes: 15m, 30m, 1h, 2h, 3h, 4h (5m REMOVED - too noisy)\n"
              "📊 Sentiment: CoinGecko Global\n"
-             "🎯 STRATEGIC SWING-BASED TP/SL SYSTEM ACTIVE\n"
+             "🎯 PROFESSIONAL TP/SL RULES IMPLEMENTED:\n"
+             "   🛑 SL: ALWAYS from AT LEAST ONE TF HIGHER than entry\n"
+             "   🎯 TP1: Market Reaction (next TF swing)\n"
+             "   🎯 TP2: Market Structure (stronger TF swing)\n"
+             "   🎯 TP3: Market Expansion (runner, R:R based)\n"
              "🔍 FILTER: Entry TF Volume = ✅ REQUIRED\n"
              "⚠️ THRESHOLDS: MIN_TF_SCORE=25, CONF_MIN_TFS=1, CONFIDENCE_MIN=25\n"
-             "📊 Expected: Better R:R with strategic swing levels")
+             "📊 Expected: Professional-grade R:R with REAL HTF swings")
 
 try:
     SYMBOLS = get_top_symbols(TOP_SYMBOLS)
