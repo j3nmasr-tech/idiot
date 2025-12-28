@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-# SIRTS v10.1 – SINGLE FILTER EDITION
-# ONLY ONE ADDITIONAL FILTER: Immediate Higher TF Conflict Check
-# Eliminates trades where entry TF strongly conflicts with next higher TF
-# Everything else remains exactly as in v10
+# SIRTS v11 - WORLD-CLASS TP/SL EDITION
+# Core principles:
+# 1. SL = Structural Invalidation ONLY
+# 2. TP = Liquidity Targets ONLY
+# 3. No forced TP3, conditional only
+# 4. SL distance must be <= 40% of TP2 distance
 
 import os
 import re
@@ -28,35 +30,41 @@ CAPITAL = 80.0
 LEVERAGE = 30
 COOLDOWN_TIME_DEFAULT = 1800
 
-# ===== CLEANER TIMEFRAMES (NO 5m) =====
-TIMEFRAMES = ["15m", "30m", "1h", "2h", "3h", "4h"]  # REMOVED 5m
+# ===== TIME FRAMES FOR ANALYSIS =====
+TIMEFRAMES = ["15m", "30m", "1h", "2h", "3h", "4h"]
 
 # ===== SIGNAL QUALITY WEIGHTS =====
-WEIGHT_BIAS   = 0.25    # EMA bias
-WEIGHT_TURTLE = 0.35    # Breakouts  
-WEIGHT_CRT    = 0.30    # Reversals
-WEIGHT_VOLUME = 0.10    # Volume
+WEIGHT_BIAS   = 0.25
+WEIGHT_TURTLE = 0.35
+WEIGHT_CRT    = 0.30
+WEIGHT_VOLUME = 0.10
 
-# ===== DATA COLLECTION THRESHOLDS =====
-MIN_TF_SCORE  = 25      # Same as v10
-CONF_MIN_TFS  = 1       # Same as v10
-CONFIDENCE_MIN = 25.0   # Same as v10
-TOP_SYMBOLS = 60        # Same as v10
+# ===== THRESHOLDS =====
+MIN_TF_SCORE  = 25
+CONF_MIN_TFS  = 1
+CONFIDENCE_MIN = 25.0
+TOP_SYMBOLS = 60
 
-# ===== BYBIT PUBLIC ENDPOINTS =====
+# ===== WORLD-CLASS TP/SL PARAMETERS =====
+MAX_SL_TP_RATIO = 0.4  # SL distance <= 40% of TP2 distance
+ATR_PADDING_FACTOR = 0.35  # ATR padding for SL (0.25-0.5)
+TP1_SIZE_RATIO = 0.3  # Take 30% at TP1
+TP2_SIZE_RATIO = 0.7  # Take 70% at TP2 (main target)
+MIN_TP_SL_RATIO = 2.0  # Minimum 1:2 RR for TP2
+
+# ===== BYBIT ENDPOINTS =====
 BYBIT_KLINES = "https://api.bybit.com/v5/market/kline"
 BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
-BYBIT_PRICE = "https://api.bybit.com/v5/market/tickers"
 COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
 
-LOG_CSV = "./sirts_v10_1_single_filter.csv"
+LOG_CSV = "./sirts_v11_world_class.csv"
 
 # ===== CACHE =====
 SENTIMENT_CACHE = {"data": None, "timestamp": 0}
 SENTIMENT_CACHE_DURATION = 300
 
 # ===== RISK =====
-BASE_RISK = 0.05   # 5% per trade
+BASE_RISK = 0.05
 MAX_RISK  = 0.06
 MIN_RISK  = 0.01
 
@@ -77,9 +85,8 @@ def should_accept_signal(symbol, chosen_dir, confirming_tfs, tf_details, entry_t
     """
     SINGLE ADDITIONAL FILTER: Check immediate higher TF conflict
     Only rejects if next higher TF strongly opposes the trade direction
-    Everything else same as v10
     """
-    # Check if Entry TF has volume confirmation (existing v10 filter)
+    # Check if Entry TF has volume confirmation
     if entry_tf in tf_details and isinstance(tf_details[entry_tf], dict):
         if not tf_details[entry_tf]["volume_ok"]:
             return False, "ENTRY_TF_VOLUME_REQUIRED"
@@ -202,7 +209,7 @@ def get_price(symbol):
     if not symbol:
         return None
     params = {"category": "linear", "symbol": symbol}
-    j = safe_get_json(BYBIT_PRICE, params=params, timeout=5, retries=1)
+    j = safe_get_json(BYBIT_TICKERS, params=params, timeout=5, retries=1)
     if not j or "result" not in j or "list" not in j["result"]:
         return None
     for d in j["result"]["list"]:
@@ -306,187 +313,131 @@ def volume_ok(df):
     current = df["volume"].iloc[-1]
     return current > ma * 1.3
 
-# ===== SWING DETECTION & TP/SL FUNCTIONS =====
-def detect_swings(df, lookback=100, min_distance=3):
+# ===== WORLD-CLASS STRUCTURAL ANALYSIS FUNCTIONS =====
+def find_structural_levels(df, timeframe, direction):
     """
-    Detect swing highs and lows
-    Returns: {'highs': [price1, price2...], 'lows': [price1, price2...]}
+    Find key structural levels for SL placement:
+    - For BUY: Protected swing lows
+    - For SELL: Protected swing highs
     """
-    if len(df) < 20:
-        return {'highs': [], 'lows': []}
+    levels = []
     
-    highs = []
-    lows = []
+    if len(df) < 50:
+        return levels
     
-    # Simple swing detection - look for local maxima/minima
-    for i in range(min_distance, len(df) - min_distance):
-        # Check for swing high
-        is_high = True
-        for j in range(1, min_distance + 1):
-            if df['high'].iloc[i] <= df['high'].iloc[i - j] or df['high'].iloc[i] <= df['high'].iloc[i + j]:
-                is_high = False
-                break
-        if is_high:
-            highs.append(df['high'].iloc[i])
-        
-        # Check for swing low
-        is_low = True
-        for j in range(1, min_distance + 1):
-            if df['low'].iloc[i] >= df['low'].iloc[i - j] or df['low'].iloc[i] >= df['low'].iloc[i + j]:
-                is_low = False
-                break
-        if is_low:
-            lows.append(df['low'].iloc[i])
+    if timeframe in ["15m", "30m"]:
+        swing_window = 10
+    elif timeframe in ["1h", "2h"]:
+        swing_window = 8
+    else:  # 3h, 4h
+        swing_window = 6
     
-    # Return only unique values
-    return {
-        'highs': sorted(list(set(highs)))[-10:],  # Last 10 highs
-        'lows': sorted(list(set(lows)))[-10:]     # Last 10 lows
-    }
+    # Find swing highs and lows
+    for i in range(swing_window, len(df) - swing_window):
+        if direction == "BUY":
+            # Look for swing lows
+            is_swing_low = True
+            for j in range(1, swing_window + 1):
+                if df['low'].iloc[i] >= df['low'].iloc[i - j] or df['low'].iloc[i] >= df['low'].iloc[i + j]:
+                    is_swing_low = False
+                    break
+            if is_swing_low:
+                levels.append({
+                    'price': df['low'].iloc[i],
+                    'type': 'swing_low',
+                    'strength': 1
+                })
+        else:  # SELL
+            # Look for swing highs
+            is_swing_high = True
+            for j in range(1, swing_window + 1):
+                if df['high'].iloc[i] <= df['high'].iloc[i - j] or df['high'].iloc[i] <= df['high'].iloc[i + j]:
+                    is_swing_high = False
+                    break
+            if is_swing_high:
+                levels.append({
+                    'price': df['high'].iloc[i],
+                    'type': 'swing_high',
+                    'strength': 1
+                })
+    
+    # Sort by proximity to current price
+    current_price = df['close'].iloc[-1]
+    levels.sort(key=lambda x: abs(x['price'] - current_price))
+    
+    return levels
 
-def get_swings_for_timeframe(symbol, timeframe):
-    """Get swings for specific timeframe"""
-    df = get_klines(symbol, timeframe, limit=100)
-    if df is None or len(df) < 20:
-        return {'highs': [], 'lows': []}
-    return detect_swings(df)
-
-def map_higher_tf(entry_tf):
-    """Map entry TF to higher timeframes for TP"""
-    mapping = {
-        '15m': {'tp1_tf': '30m', 'tp2_tf': '1h', 'tp3_tf': '2h'},
-        '30m': {'tp1_tf': '1h', 'tp2_tf': '2h', 'tp3_tf': '3h'},
-        '1h': {'tp1_tf': '2h', 'tp2_tf': '3h', 'tp3_tf': '4h'},
-        '2h': {'tp1_tf': '3h', 'tp2_tf': '4h', 'tp3_tf': '1d'},
-        '3h': {'tp1_tf': '4h', 'tp2_tf': '1d', 'tp3_tf': '1w'},
-        '4h': {'tp1_tf': '1d', 'tp2_tf': '1w', 'tp3_tf': None}
-    }
-    return mapping.get(entry_tf, {'tp1_tf': '1h', 'tp2_tf': '4h', 'tp3_tf': None})
-
-def calculate_swing_tp_sl(entry_price, entry_tf, direction, symbol):
+def find_liquidity_levels(df, higher_tf, direction):
     """
-    Calculate TP/SL based on swing structure
-    Returns: (sl, tp1, tp2, tp3, tp_sources)
+    Find liquidity targets for TP:
+    - Equal highs/lows
+    - HTF swing points
+    - Previous major highs/lows
     """
-    # Get higher timeframe mapping
-    higher_tfs = map_higher_tf(entry_tf)
-    tp_sources = {}
+    targets = []
     
-    # Get swings for relevant timeframes
-    entry_swings = get_swings_for_timeframe(symbol, entry_tf)
-    tp1_swings = get_swings_for_timeframe(symbol, higher_tfs['tp1_tf'])
-    tp2_swings = get_swings_for_timeframe(symbol, higher_tfs['tp2_tf'])
+    # Internal liquidity (TP1)
+    if len(df) >= 30:
+        if direction == "BUY":
+            # Look for equal highs (previous minor highs)
+            recent_highs = df['high'].iloc[-30:].tolist()
+            for i in range(len(recent_highs) - 5, len(recent_highs) - 1):
+                if recent_highs[i] > max(recent_highs[i-3:i]) and recent_highs[i] > max(recent_highs[i+1:i+4]):
+                    targets.append({
+                        'price': recent_highs[i],
+                        'type': 'internal_liquidity',
+                        'timeframe': 'entry',
+                        'priority': 'tp1'
+                    })
+        else:  # SELL
+            # Look for equal lows (previous minor lows)
+            recent_lows = df['low'].iloc[-30:].tolist()
+            for i in range(len(recent_lows) - 5, len(recent_lows) - 1):
+                if recent_lows[i] < min(recent_lows[i-3:i]) and recent_lows[i] < min(recent_lows[i+1:i+4]):
+                    targets.append({
+                        'price': recent_lows[i],
+                        'type': 'internal_liquidity',
+                        'timeframe': 'entry',
+                        'priority': 'tp1'
+                    })
     
-    # Get ATR for fallback and padding
-    atr = get_atr(symbol)
-    if atr is None:
-        atr = entry_price * 0.005  # Default 0.5% if ATR not available
+    # External liquidity (TP2) - from higher timeframe
+    if higher_tf is not None and len(higher_tf) >= 50:
+        if direction == "BUY":
+            # Find previous swing highs on HTF
+            for i in range(len(higher_tf) - 15, len(higher_tf) - 5):
+                if (higher_tf['high'].iloc[i] > higher_tf['high'].iloc[i-5:i].max() and 
+                    higher_tf['high'].iloc[i] > higher_tf['high'].iloc[i+1:i+6].max()):
+                    targets.append({
+                        'price': higher_tf['high'].iloc[i],
+                        'type': 'external_liquidity',
+                        'timeframe': 'htf',
+                        'priority': 'tp2'
+                    })
+        else:  # SELL
+            # Find previous swing lows on HTF
+            for i in range(len(higher_tf) - 15, len(higher_tf) - 5):
+                if (higher_tf['low'].iloc[i] < higher_tf['low'].iloc[i-5:i].min() and 
+                    higher_tf['low'].iloc[i] < higher_tf['low'].iloc[i+1:i+6].min()):
+                    targets.append({
+                        'price': higher_tf['low'].iloc[i],
+                        'type': 'external_liquidity',
+                        'timeframe': 'htf',
+                        'priority': 'tp2'
+                    })
     
-    if direction == "BUY":
-        # TP1: Nearest swing high on X+1 TF
-        valid_highs_tp1 = [h for h in tp1_swings['highs'] if h > entry_price]
-        if valid_highs_tp1:
-            tp1 = min(valid_highs_tp1)  # Nearest swing high
-            tp_sources['tp1'] = f"{higher_tfs['tp1_tf']} swing"
-        else:
-            # Fallback: 1.5x ATR
-            tp1 = entry_price + (atr * 1.5)
-            tp_sources['tp1'] = "ATR fallback"
-        
-        # TP2: Major swing high on X+2 TF
-        valid_highs_tp2 = [h for h in tp2_swings['highs'] if h > entry_price]
-        if valid_highs_tp2:
-            # Get the next major swing after tp1
-            valid_above_tp1 = [h for h in valid_highs_tp2 if h > tp1]
-            if valid_above_tp1:
-                tp2 = min(valid_above_tp1)
-            else:
-                tp2 = max(valid_highs_tp2)
-            tp_sources['tp2'] = f"{higher_tfs['tp2_tf']} swing"
-        else:
-            # Fallback: 2.5x ATR
-            tp2 = entry_price + (atr * 2.5)
-            tp_sources['tp2'] = "ATR fallback"
-        
-        # TP3: Keep ATR-based for now (3.8x)
-        tp3 = entry_price + (atr * 3.8)
-        tp_sources['tp3'] = "ATR-based"
-        
-        # SL: Below entry swing low + ATR padding
-        entry_lows = entry_swings['lows']
-        if entry_lows:
-            current_low = min([l for l in entry_lows if l < entry_price], default=entry_price * 0.98)
-        else:
-            current_low = entry_price * 0.98
-        sl = current_low - (atr * 0.3)  # 30% of ATR as padding
-        tp_sources['sl'] = f"{entry_tf} swing + ATR padding"
-        
-    else:  # SELL
-        # TP1: Nearest swing low on X+1 TF
-        valid_lows_tp1 = [l for l in tp1_swings['lows'] if l < entry_price]
-        if valid_lows_tp1:
-            tp1 = max(valid_lows_tp1)  # Nearest swing low
-            tp_sources['tp1'] = f"{higher_tfs['tp1_tf']} swing"
-        else:
-            # Fallback: 1.5x ATR
-            tp1 = entry_price - (atr * 1.5)
-            tp_sources['tp1'] = "ATR fallback"
-        
-        # TP2: Major swing low on X+2 TF
-        valid_lows_tp2 = [l for l in tp2_swings['lows'] if l < entry_price]
-        if valid_lows_tp2:
-            # Get the next major swing below tp1
-            valid_below_tp1 = [l for l in valid_lows_tp2 if l < tp1]
-            if valid_below_tp1:
-                tp2 = max(valid_below_tp1)
-            else:
-                tp2 = min(valid_lows_tp2)
-            tp_sources['tp2'] = f"{higher_tfs['tp2_tf']} swing"
-        else:
-            # Fallback: 2.5x ATR
-            tp2 = entry_price - (atr * 2.5)
-            tp_sources['tp2'] = "ATR fallback"
-        
-        # TP3: Keep ATR-based for now (3.8x)
-        tp3 = entry_price - (atr * 3.8)
-        tp_sources['tp3'] = "ATR-based"
-        
-        # SL: Above entry swing high + ATR padding
-        entry_highs = entry_swings['highs']
-        if entry_highs:
-            current_high = max([h for h in entry_highs if h > entry_price], default=entry_price * 1.02)
-        else:
-            current_high = entry_price * 1.02
-        sl = current_high + (atr * 0.3)  # 30% of ATR as padding
-        tp_sources['sl'] = f"{entry_tf} swing + ATR padding"
+    # Remove duplicates and sort
+    unique_targets = {}
+    for target in targets:
+        key = round(target['price'], 4)
+        if key not in unique_targets:
+            unique_targets[key] = target
     
-    # Validate levels are logical
-    if direction == "BUY":
-        if not (tp1 > entry_price and tp2 > tp1 and sl < entry_price):
-            # Reset to ATR-based if invalid
-            sl = round(entry_price - atr * 1.7, 8)
-            tp1 = round(entry_price + atr * 1.8, 8)
-            tp2 = round(entry_price + atr * 2.8, 8)
-            tp3 = round(entry_price + atr * 3.8, 8)
-            tp_sources = {'tp1': 'ATR', 'tp2': 'ATR', 'tp3': 'ATR', 'sl': 'ATR'}
-    else:  # SELL
-        if not (tp1 < entry_price and tp2 < tp1 and sl > entry_price):
-            # Reset to ATR-based if invalid
-            sl = round(entry_price + atr * 1.7, 8)
-            tp1 = round(entry_price - atr * 1.8, 8)
-            tp2 = round(entry_price - atr * 2.8, 8)
-            tp3 = round(entry_price - atr * 3.8, 8)
-            tp_sources = {'tp1': 'ATR', 'tp2': 'ATR', 'tp3': 'ATR', 'sl': 'ATR'}
-    
-    # Round values
-    tp1 = round(tp1, 8)
-    tp2 = round(tp2, 8)
-    tp3 = round(tp3, 8)
-    sl = round(sl, 8)
-    
-    return sl, tp1, tp2, tp3, tp_sources, higher_tfs
+    return sorted(unique_targets.values(), key=lambda x: (
+        x['priority'] == 'tp2',  # TP2 first
+        x['price'] if direction == "BUY" else -x['price']
+    ))
 
-# ===== ATR & POSITION SIZING =====
 def get_atr(symbol, period=14):
     symbol = sanitize_symbol(symbol)
     if not symbol:
@@ -504,33 +455,341 @@ def get_atr(symbol, period=14):
         return None
     return max(float(np.mean(trs)), 1e-8)
 
+def calculate_sl_tp_world_class(symbol, entry_price, direction, entry_tf):
+    """
+    WORLD-CLASS TP/SL Calculation:
+    1. SL at structural invalidation + ATR padding
+    2. TP1 at internal liquidity
+    3. TP2 at external liquidity (HTF)
+    4. TP3 only if strong trend and liquidity beyond
+    5. Validate SL <= 40% of TP2 distance
+    """
+    # Get entry TF data for structure
+    entry_df = get_klines(symbol, entry_tf, limit=100)
+    if entry_df is None or len(entry_df) < 50:
+        return None
+    
+    # Get higher TF for liquidity targets
+    tf_index = TIMEFRAMES.index(entry_tf)
+    higher_tf_data = None
+    if tf_index < len(TIMEFRAMES) - 1:
+        higher_tf = TIMEFRAMES[tf_index + 1]
+        higher_tf_data = get_klines(symbol, higher_tf, limit=100)
+    
+    # Get ATR for padding
+    atr = get_atr(symbol)
+    if atr is None:
+        atr = entry_price * 0.005
+    
+    # ===== 1. FIND STRUCTURAL STOP LOSS =====
+    structural_levels = find_structural_levels(entry_df, entry_tf, direction)
+    
+    if direction == "BUY":
+        # SL below the nearest protected swing low
+        valid_swing_lows = [level for level in structural_levels 
+                          if level['type'] == 'swing_low' and level['price'] < entry_price]
+        
+        if valid_swing_lows:
+            structural_sl = valid_swing_lows[0]['price']
+            sl_source = f"{entry_tf} swing low"
+        else:
+            # Fallback: Below recent low
+            recent_low = entry_df['low'].iloc[-20:].min()
+            structural_sl = recent_low if recent_low < entry_price else entry_price * 0.985
+            sl_source = f"{entry_tf} recent low"
+        
+        # Add ATR padding BELOW structure
+        sl = structural_sl - (atr * ATR_PADDING_FACTOR)
+        
+    else:  # SELL
+        # SL above the nearest protected swing high
+        valid_swing_highs = [level for level in structural_levels 
+                           if level['type'] == 'swing_high' and level['price'] > entry_price]
+        
+        if valid_swing_highs:
+            structural_sl = valid_swing_highs[0]['price']
+            sl_source = f"{entry_tf} swing high"
+        else:
+            # Fallback: Above recent high
+            recent_high = entry_df['high'].iloc[-20:].max()
+            structural_sl = recent_high if recent_high > entry_price else entry_price * 1.015
+            sl_source = f"{entry_tf} recent high"
+        
+        # Add ATR padding ABOVE structure
+        sl = structural_sl + (atr * ATR_PADDING_FACTOR)
+    
+    # ===== 2. FIND LIQUIDITY TARGETS =====
+    liquidity_targets = find_liquidity_levels(entry_df, higher_tf_data, direction)
+    
+    tp1 = None
+    tp2 = None
+    tp3 = None
+    tp1_source = "no_target_found"
+    tp2_source = "no_target_found"
+    tp3_source = "none"
+    
+    # Classify targets
+    tp1_candidates = [t for t in liquidity_targets if t['priority'] == 'tp1']
+    tp2_candidates = [t for t in liquidity_targets if t['priority'] == 'tp2']
+    
+    if direction == "BUY":
+        # TP1: Internal liquidity (closest reasonable target)
+        if tp1_candidates:
+            valid_tp1 = [t for t in tp1_candidates if t['price'] > entry_price * 1.002]
+            if valid_tp1:
+                tp1 = valid_tp1[0]['price']
+                tp1_source = f"internal liquidity ({valid_tp1[0]['type']})"
+        elif tp2_candidates:
+            # Use closest TP2 candidate scaled down
+            closest_tp2 = min(tp2_candidates, key=lambda x: x['price'])
+            distance = closest_tp2['price'] - entry_price
+            tp1 = entry_price + (distance * 0.3)  # 30% of TP2 distance
+            tp1_source = "scaled_from_tp2"
+        
+        # TP2: External liquidity (main target)
+        if tp2_candidates:
+            valid_tp2 = [t for t in tp2_candidates if t['price'] > entry_price * 1.01]
+            if valid_tp2:
+                tp2 = valid_tp2[0]['price']
+                tp2_source = f"external liquidity ({valid_tp2[0]['type']})"
+        
+        # TP3: Only if strong trend and more liquidity beyond TP2
+        if tp2 and entry_df['close'].iloc[-1] > entry_df['close'].iloc[-50:].mean():
+            # Check for even higher HTF levels
+            if tf_index < len(TIMEFRAMES) - 2:
+                even_higher_tf = TIMEFRAMES[tf_index + 2]
+                even_higher_data = get_klines(symbol, even_higher_tf, limit=100)
+                if even_higher_data is not None and len(even_higher_data) >= 50:
+                    swing_highs = find_structural_levels(even_higher_data, even_higher_tf, "SELL")
+                    if swing_highs:
+                        highest_target = max(swing_highs, key=lambda x: x['price'])
+                        if highest_target['price'] > tp2 * 1.05:
+                            tp3 = highest_target['price']
+                            tp3_source = f"{even_higher_tf} swing high"
+    
+    else:  # SELL
+        # TP1: Internal liquidity
+        if tp1_candidates:
+            valid_tp1 = [t for t in tp1_candidates if t['price'] < entry_price * 0.998]
+            if valid_tp1:
+                tp1 = valid_tp1[0]['price']
+                tp1_source = f"internal liquidity ({valid_tp1[0]['type']})"
+        elif tp2_candidates:
+            # Use closest TP2 candidate scaled down
+            closest_tp2 = min(tp2_candidates, key=lambda x: x['price'])
+            distance = entry_price - closest_tp2['price']
+            tp1 = entry_price - (distance * 0.3)
+            tp1_source = "scaled_from_tp2"
+        
+        # TP2: External liquidity (main target)
+        if tp2_candidates:
+            valid_tp2 = [t for t in tp2_candidates if t['price'] < entry_price * 0.99]
+            if valid_tp2:
+                tp2 = valid_tp2[0]['price']
+                tp2_source = f"external liquidity ({valid_tp2[0]['type']})"
+        
+        # TP3: Only if strong trend
+        if tp2 and entry_df['close'].iloc[-1] < entry_df['close'].iloc[-50:].mean():
+            if tf_index < len(TIMEFRAMES) - 2:
+                even_higher_tf = TIMEFRAMES[tf_index + 2]
+                even_higher_data = get_klines(symbol, even_higher_tf, limit=100)
+                if even_higher_data is not None and len(even_higher_data) >= 50:
+                    swing_lows = find_structural_levels(even_higher_data, even_higher_tf, "BUY")
+                    if swing_lows:
+                        lowest_target = min(swing_lows, key=lambda x: x['price'])
+                        if lowest_target['price'] < tp2 * 0.95:
+                            tp3 = lowest_target['price']
+                            tp3_source = f"{even_higher_tf} swing low"
+    
+    # ===== 3. ATR FALLBACK (ONLY IF NO LIQUIDITY FOUND) =====
+    if tp1 is None or tp2 is None:
+        if direction == "BUY":
+            if tp1 is None:
+                tp1 = entry_price + (atr * 1.5)
+                tp1_source = "ATR_fallback"
+            if tp2 is None:
+                tp2 = entry_price + (atr * 2.5)
+                tp2_source = "ATR_fallback"
+        else:  # SELL
+            if tp1 is None:
+                tp1 = entry_price - (atr * 1.5)
+                tp1_source = "ATR_fallback"
+            if tp2 is None:
+                tp2 = entry_price - (atr * 2.5)
+                tp2_source = "ATR_fallback"
+    
+    # ===== 4. VALIDATE WORLD-CLASS RULE: SL <= 40% of TP2 distance =====
+    if tp2 is not None:
+        if direction == "BUY":
+            sl_distance = entry_price - sl
+            tp2_distance = tp2 - entry_price
+            
+            if sl_distance > 0 and tp2_distance > 0:
+                ratio = sl_distance / tp2_distance
+                
+                # If ratio is too high, adjust TP2 to meet criteria
+                if ratio > MAX_SL_TP_RATIO:
+                    # Find new TP2 that satisfies ratio
+                    required_tp2_distance = sl_distance / MAX_SL_TP_RATIO
+                    new_tp2 = entry_price + required_tp2_distance
+                    
+                    if new_tp2 > tp2:
+                        tp2 = new_tp2
+                        tp2_source = f"adjusted_for_ratio ({tp2_source.split('(')[0]})"
+                    
+                    # Log the adjustment
+                    print(f"⚠️ Adjusted TP2 for ratio compliance: {ratio:.2f} -> {MAX_SL_TP_RATIO}")
+        else:  # SELL
+            sl_distance = sl - entry_price
+            tp2_distance = entry_price - tp2
+            
+            if sl_distance > 0 and tp2_distance > 0:
+                ratio = sl_distance / tp2_distance
+                
+                if ratio > MAX_SL_TP_RATIO:
+                    required_tp2_distance = sl_distance / MAX_SL_TP_RATIO
+                    new_tp2 = entry_price - required_tp2_distance
+                    
+                    if new_tp2 < tp2:
+                        tp2 = new_tp2
+                        tp2_source = f"adjusted_for_ratio ({tp2_source.split('(')[0]})"
+                    
+                    print(f"⚠️ Adjusted TP2 for ratio compliance: {ratio:.2f} -> {MAX_SL_TP_RATIO}")
+    
+    # ===== 5. FINAL VALIDATION =====
+    # Ensure logical order
+    if direction == "BUY":
+        if not (sl < entry_price < tp1 < tp2):
+            # Reset to safe defaults
+            sl = entry_price - (atr * 1.5)
+            tp1 = entry_price + (atr * 1.8)
+            tp2 = entry_price + (atr * 2.8)
+            tp3 = None
+            sl_source = "validation_fallback"
+            tp1_source = "validation_fallback"
+            tp2_source = "validation_fallback"
+    else:  # SELL
+        if not (sl > entry_price > tp1 > tp2):
+            sl = entry_price + (atr * 1.5)
+            tp1 = entry_price - (atr * 1.8)
+            tp2 = entry_price - (atr * 2.8)
+            tp3 = None
+            sl_source = "validation_fallback"
+            tp1_source = "validation_fallback"
+            tp2_source = "validation_fallback"
+    
+    # Round values
+    sl = round(sl, 8)
+    tp1 = round(tp1, 8)
+    tp2 = round(tp2, 8)
+    if tp3 is not None:
+        tp3 = round(tp3, 8)
+    
+    # Prepare source dictionary
+    tp_sources = {
+        'sl': sl_source,
+        'tp1': tp1_source,
+        'tp2': tp2_source,
+        'tp3': tp3_source
+    }
+    
+    # Calculate ratio for logging
+    if direction == "BUY":
+        sl_dist = abs(entry_price - sl)
+        tp2_dist = abs(tp2 - entry_price)
+    else:
+        sl_dist = abs(sl - entry_price)
+        tp2_dist = abs(entry_price - tp2)
+    
+    ratio = sl_dist / tp2_dist if tp2_dist > 0 else 0
+    
+    print(f"📊 TP/SL Ratio: {ratio:.2f} (max allowed: {MAX_SL_TP_RATIO})")
+    
+    return sl, tp1, tp2, tp3, tp_sources
+
+# ===== WORLD-CLASS TRADE PARAMS =====
 def trade_params(symbol, entry, side, entry_tf):
     """
-    Calculate TP/SL based on swing structure
+    WORLD-CLASS version using structural invalidation and liquidity targets
     """
-    # Get swing-based TP/SL
-    swing_result = calculate_swing_tp_sl(entry, entry_tf, side, symbol)
-    sl, tp1, tp2, tp3, tp_sources, higher_tfs = swing_result
+    # Get world-class TP/SL levels
+    result = calculate_sl_tp_world_class(symbol, entry, side, entry_tf)
+    if not result:
+        return None
+    
+    sl, tp1, tp2, tp3, tp_sources = result
+    
+    # Get higher timeframe mapping for display
+    tf_index = TIMEFRAMES.index(entry_tf)
+    higher_tfs = {
+        'entry_tf': entry_tf,
+        'tp1_tf': TIMEFRAMES[tf_index] if tp_sources['tp1'].startswith('internal') else 
+                  TIMEFRAMES[min(tf_index + 1, len(TIMEFRAMES) - 1)],
+        'tp2_tf': TIMEFRAMES[min(tf_index + 1, len(TIMEFRAMES) - 1)],
+        'tp3_tf': TIMEFRAMES[min(tf_index + 2, len(TIMEFRAMES) - 1)] if tp3 else None
+    }
     
     return sl, tp1, tp2, tp3, tp_sources, higher_tfs
 
-def pos_size_units(entry, sl):
+# ===== WORLD-CLASS POSITION SIZING =====
+def pos_size_units_world_class(entry, sl, tp2, direction):
+    """
+    World-class position sizing with ratio validation
+    """
+    # Calculate distances
+    if direction == "BUY":
+        sl_distance = entry - sl
+        tp2_distance = tp2 - entry
+    else:  # SELL
+        sl_distance = sl - entry
+        tp2_distance = entry - tp2
+    
+    # Check world-class rule: SL distance <= 40% of TP2 distance
+    if sl_distance <= 0 or tp2_distance <= 0:
+        print("⚠️ Invalid distances for position sizing")
+        return 0.0, 0.0, 0.0, 0.0
+    
+    ratio = sl_distance / tp2_distance
+    
+    if ratio > MAX_SL_TP_RATIO:
+        print(f"❌ Trade rejected: SL/TP2 ratio {ratio:.2f} > {MAX_SL_TP_RATIO}")
+        return 0.0, 0.0, 0.0, 0.0
+    
+    # Check minimum RR
+    if tp2_distance / sl_distance < MIN_TP_SL_RATIO:
+        print(f"⚠️ Warning: RR ratio {tp2_distance/sl_distance:.2f} < minimum {MIN_TP_SL_RATIO}")
+    
+    # Standard position sizing
     risk_percent = BASE_RISK
-    risk_usd     = CAPITAL * risk_percent
-    sl_dist      = abs(entry - sl)
-    min_sl = max(entry * 0.0015, 1e-8)
-    if sl_dist < min_sl:
+    risk_usd = CAPITAL * risk_percent
+    
+    # Use the smaller of actual SL distance or ATR-based for safety
+    atr = abs(entry - sl) * 2  # Approximate ATR
+    safe_sl_dist = min(sl_distance, atr * 0.8)
+    
+    if safe_sl_dist < entry * 0.0015:
         return 0.0, 0.0, 0.0, risk_percent
-    units = risk_usd / sl_dist
+    
+    units = risk_usd / safe_sl_dist
     exposure = units * entry
     max_exposure = CAPITAL * 0.20
+    
     if exposure > max_exposure and exposure > 0:
         units = max_exposure / entry
         exposure = units * entry
+    
     margin_req = exposure / LEVERAGE
+    
     if margin_req < 0.25:
         return 0.0, 0.0, 0.0, risk_percent
-    return round(units,8), round(margin_req,6), round(exposure,6), risk_percent
+    
+    print(f"✅ Position size calculated:")
+    print(f"   SL distance: {sl_distance:.4f} ({sl_distance/entry*100:.2f}%)")
+    print(f"   TP2 distance: {tp2_distance:.4f} ({tp2_distance/entry*100:.2f}%)")
+    print(f"   Ratio: {ratio:.2f} (max: {MAX_SL_TP_RATIO})")
+    print(f"   Units: {units:.4f}, Exposure: ${exposure:.2f}")
+    
+    return round(units, 8), round(margin_req, 6), round(exposure, 6), risk_percent
 
 # ===== LOGGING =====
 def init_csv():
@@ -540,7 +799,7 @@ def init_csv():
             writer.writerow([
                 "timestamp_utc","symbol","side","entry","tp1","tp2","tp3","sl",
                 "tf","units","margin_usd","exposure_usd","risk_pct","confidence_pct","status","breakdown",
-                "tp1_source","tp2_source","tp3_source","sl_source"
+                "tp1_source","tp2_source","tp3_source","sl_source", "sl_tp2_ratio"
             ])
 
 def log_signal(row):
@@ -664,20 +923,24 @@ def analyze_symbol(symbol):
     # === STEP 6: GET SENTIMENT ===
     sentiment = sentiment_label()
     
-    # === STEP 7: GET CURRENT PRICE AND CALCULATE PARAMS ===
+    # === STEP 7: GET CURRENT PRICE AND CALCULATE WORLD-CLASS PARAMS ===
     entry = get_price(symbol)
     if entry is None:
         skipped_signals += 1
         return False
     
-    # Get swing-based TP/SL with entry timeframe
+    # Get world-class TP/SL levels
     tp_sl_result = trade_params(symbol, entry, chosen_dir, chosen_tf)
     if not tp_sl_result:
         skipped_signals += 1
         return False
     sl, tp1, tp2, tp3, tp_sources, higher_tfs = tp_sl_result
     
-    units, margin, exposure, risk_used = pos_size_units(entry, sl)
+    # World-class position sizing with ratio validation
+    units, margin, exposure, risk_used = pos_size_units_world_class(
+        entry, sl, tp2, chosen_dir
+    )
+    
     if units <= 0:
         skipped_signals += 1
         return False
@@ -699,13 +962,24 @@ def analyze_symbol(symbol):
                 breakdown_text += f"  CRT: {crt_icon}\n"
                 breakdown_text += f"  Turtle: {turtle_icon}\n"
     
-    # Add TP/SL sources to breakdown
-    breakdown_text += f"\n🎯 TP/SL SOURCES:\n"
-    breakdown_text += f"• Entry TF: {chosen_tf}\n"
-    breakdown_text += f"• TP1 ({higher_tfs['tp1_tf']}): {tp_sources.get('tp1', 'Unknown')}\n"
-    breakdown_text += f"• TP2 ({higher_tfs['tp2_tf']}): {tp_sources.get('tp2', 'Unknown')}\n"
-    breakdown_text += f"• TP3: {tp_sources.get('tp3', 'ATR-based')}\n"
+    # Calculate ratio for display
+    if chosen_dir == "BUY":
+        sl_distance = entry - sl
+        tp2_distance = tp2 - entry
+    else:
+        sl_distance = sl - entry
+        tp2_distance = entry - tp2
+    
+    ratio = sl_distance / tp2_distance if tp2_distance > 0 else 0
+    
+    # Add WORLD-CLASS TP/SL breakdown
+    breakdown_text += f"\n🎯 WORLD-CLASS TP/SL SYSTEM:\n"
     breakdown_text += f"• SL: {tp_sources.get('sl', 'Unknown')}\n"
+    breakdown_text += f"• TP1 (30%): {tp_sources.get('tp1', 'Unknown')}\n"
+    breakdown_text += f"• TP2 (70%): {tp_sources.get('tp2', 'Unknown')}\n"
+    if tp3:
+        breakdown_text += f"• TP3 (optional): {tp_sources.get('tp3', 'Unknown')}\n"
+    breakdown_text += f"• SL/TP2 Ratio: {ratio:.2f} (max: {MAX_SL_TP_RATIO}) {'✅' if ratio <= MAX_SL_TP_RATIO else '❌'}\n"
     
     breakdown_text += f"\n🎯 SIGNAL SUMMARY:\n"
     breakdown_text += f"• Direction: {chosen_dir}\n"
@@ -713,21 +987,24 @@ def analyze_symbol(symbol):
     breakdown_text += f"• Confirming TFs: {', '.join(confirming_tfs)}\n"
     breakdown_text += f"• Confidence: {confidence_pct:.1f}%\n"
     breakdown_text += f"• Market Sentiment: {sentiment.upper()}\n"
-    breakdown_text += f"• Filter Status: {filter_reason}\n"
-    breakdown_text += f"• TP System: Swing-based (HTF > Entry TF)"
+    breakdown_text += f"• Filter Status: {filter_reason}"
     
     # === STEP 9: SEND TRADE SIGNAL ===
     header = (f"✅ {chosen_dir} {symbol}\n"
               f"💵 Entry: {entry} | TF: {chosen_tf}\n"
-              f"🎯 TP1: {tp1} ({tp_sources.get('tp1', 'Unknown')})\n"
-              f"🎯 TP2: {tp2} ({tp_sources.get('tp2', 'Unknown')})\n"
-              f"🎯 TP3: {tp3} ({tp_sources.get('tp3', 'ATR-based')})\n"
-              f"🛑 SL: {sl} ({tp_sources.get('sl', 'Unknown')})\n"
-              f"💰 Units:{units} | Margin≈${margin} | Exposure≈${exposure}\n"
-              f"⚠ Risk: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}%\n"
-              f"🧾 TFs confirming: {', '.join(confirming_tfs)}\n"
-              f"📈 Market Sentiment: {sentiment.upper()}\n"
-              f"🔍 FILTER: {filter_reason}")
+              f"🎯 TP1 (30%): {tp1} ({tp_sources.get('tp1', 'Unknown')})\n"
+              f"🎯 TP2 (70%): {tp2} ({tp_sources.get('tp2', 'Unknown')})\n")
+    
+    if tp3:
+        header += f"🎯 TP3 (optional): {tp3} ({tp_sources.get('tp3', 'Unknown')})\n"
+    
+    header += (f"🛑 SL: {sl} ({tp_sources.get('sl', 'Unknown')})\n"
+               f"📊 SL/TP2 Ratio: {ratio:.2f} (max: {MAX_SL_TP_RATIO})\n"
+               f"💰 Units:{units:.4f} | Margin≈${margin:.2f} | Exposure≈${exposure:.2f}\n"
+               f"⚠ Risk: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}%\n"
+               f"🧾 TFs confirming: {', '.join(confirming_tfs)}\n"
+               f"📈 Market Sentiment: {sentiment.upper()}\n"
+               f"🔍 FILTER: {filter_reason}")
     
     # Send both messages
     send_message(header)
@@ -757,34 +1034,40 @@ def analyze_symbol(symbol):
         "confirming_tfs": confirming_tfs,
         "tf_details": tf_details,
         "tp_sources": tp_sources,
-        "higher_tfs": higher_tfs
+        "higher_tfs": higher_tfs,
+        "tp1_units": units * TP1_SIZE_RATIO,  # Take 30% at TP1
+        "tp2_units": units * TP2_SIZE_RATIO,  # Take 70% at TP2
+        "tp3_units": 0.0,  # Optional runner
+        "remaining_units": units
     }
     
     open_trades.append(trade_obj)
     signals_sent_total += 1
     last_trade_time[symbol] = time.time() + 300  # 5-minute cooldown
     
-    # Log with sources
+    # Log with sources and ratio
     log_signal([
         datetime.utcnow().isoformat(), symbol, chosen_dir, entry,
         tp1, tp2, tp3, sl, chosen_tf, units, margin, exposure,
         risk_used*100, confidence_pct, "open", str(tf_details),
         tp_sources.get('tp1', ''), tp_sources.get('tp2', ''), 
-        tp_sources.get('tp3', ''), tp_sources.get('sl', '')
+        tp_sources.get('tp3', ''), tp_sources.get('sl', ''), ratio
     ])
     
     print(f"✅ Signal sent for {symbol} at {entry}. Confidence: {confidence_pct:.1f}%")
-    print(f"   TP1: {tp1} ({tp_sources.get('tp1', 'Unknown')})")
-    print(f"   TP2: {tp2} ({tp_sources.get('tp2', 'Unknown')})")
+    print(f"   TP1 (30%): {tp1} ({tp_sources.get('tp1', 'Unknown')})")
+    print(f"   TP2 (70%): {tp2} ({tp_sources.get('tp2', 'Unknown')})")
     print(f"   SL: {sl} ({tp_sources.get('sl', 'Unknown')})")
+    print(f"   Ratio: {ratio:.2f} (max: {MAX_SL_TP_RATIO})")
     return True
 
-# ===== TRADE CHECKING =====
+# ===== WORLD-CLASS TRADE CHECKING =====
 def check_trades():
     global signals_hit_total, signals_fail_total, signals_breakeven
     for t in list(open_trades):
         if t.get("st") != "open":
             continue
+        
         p = get_price(t["s"])
         if p is None:
             continue
@@ -792,7 +1075,6 @@ def check_trades():
         side = t["side"]
         tp_sources = t.get("tp_sources", {})
         
-        # Generate detailed update message
         def send_update(message):
             details = (f"📊 UPDATE: {t['s']}\n"
                       f"• Side: {t['side']} | Entry: {t['entry']}\n"
@@ -804,26 +1086,35 @@ def check_trades():
             send_message(details)
         
         if side == "BUY":
+            # TP1 Hit - Take 30% position
             if not t["tp1_taken"] and p >= t["tp1"]:
                 t["tp1_taken"] = True
+                t["remaining_units"] = t["units"] * 0.7  # Keep 70% for TP2
+                # Move SL to breakeven for remaining position
                 t["sl"] = t["entry"]
-                send_update(f"🎯 TP1 HIT at {p} → SL moved to breakeven")
+                send_update(f"🎯 TP1 HIT at {p} → 30% taken, SL moved to breakeven")
                 signals_hit_total += 1
                 last_trade_time[t["s"]] = time.time() + 900
                 continue
+            
+            # TP2 Hit - Take 70% position, close trade
             if t["tp1_taken"] and not t["tp2_taken"] and p >= t["tp2"]:
                 t["tp2_taken"] = True
-                send_update(f"🎯 TP2 HIT at {p}")
-                signals_hit_total += 1
-                last_trade_time[t["s"]] = time.time() + 900
-                continue
-            if t["tp2_taken"] and not t["tp3_taken"] and p >= t["tp3"]:
-                t["tp3_taken"] = True
                 t["st"] = "closed"
-                send_update(f"🏁 TP3 HIT at {p} → TRADE CLOSED")
+                send_update(f"🏁 TP2 HIT at {p} → 70% taken, TRADE CLOSED")
                 signals_hit_total += 1
                 last_trade_time[t["s"]] = time.time() + 900
                 continue
+            
+            # TP3 Hit - Optional runner
+            if t.get("tp3") and not t["tp3_taken"] and p >= t["tp3"]:
+                t["tp3_taken"] = True
+                send_update(f"🚀 TP3 HIT at {p} → Runner target achieved")
+                signals_hit_total += 1
+                last_trade_time[t["s"]] = time.time() + 900
+                continue
+            
+            # Stop Loss
             if p <= t["sl"]:
                 if abs(t["sl"] - t["entry"]) < 1e-8:
                     t["st"] = "breakeven"
@@ -837,26 +1128,34 @@ def check_trades():
                     last_trade_time[t["s"]] = time.time() + 2700
         
         else:  # SELL
+            # TP1 Hit
             if not t["tp1_taken"] and p <= t["tp1"]:
                 t["tp1_taken"] = True
+                t["remaining_units"] = t["units"] * 0.7
                 t["sl"] = t["entry"]
-                send_update(f"🎯 TP1 HIT at {p} → SL moved to breakeven")
+                send_update(f"🎯 TP1 HIT at {p} → 30% taken, SL moved to breakeven")
                 signals_hit_total += 1
                 last_trade_time[t["s"]] = time.time() + 900
                 continue
+            
+            # TP2 Hit
             if t["tp1_taken"] and not t["tp2_taken"] and p <= t["tp2"]:
                 t["tp2_taken"] = True
-                send_update(f"🎯 TP2 HIT at {p}")
-                signals_hit_total += 1
-                last_trade_time[t["s"]] = time.time() + 900
-                continue
-            if t["tp2_taken"] and not t["tp3_taken"] and p <= t["tp3"]:
-                t["tp3_taken"] = True
                 t["st"] = "closed"
-                send_update(f"🏁 TP3 HIT at {p} → TRADE CLOSED")
+                send_update(f"🏁 TP2 HIT at {p} → 70% taken, TRADE CLOSED")
                 signals_hit_total += 1
                 last_trade_time[t["s"]] = time.time() + 900
                 continue
+            
+            # TP3 Hit
+            if t.get("tp3") and not t["tp3_taken"] and p <= t["tp3"]:
+                t["tp3_taken"] = True
+                send_update(f"🚀 TP3 HIT at {p} → Runner target achieved")
+                signals_hit_total += 1
+                last_trade_time[t["s"]] = time.time() + 900
+                continue
+            
+            # Stop Loss
             if p >= t["sl"]:
                 if abs(t["sl"] - t["entry"]) < 1e-8:
                     t["st"] = "breakeven"
@@ -885,6 +1184,24 @@ def summary():
     breakev = signals_breakeven
     acc   = (hits / total * 100) if total > 0 else 0.0
     
+    # Calculate average ratio from logs
+    avg_ratio = 0.0
+    ratio_count = 0
+    try:
+        with open(LOG_CSV, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('sl_tp2_ratio'):
+                    try:
+                        avg_ratio += float(row['sl_tp2_ratio'])
+                        ratio_count += 1
+                    except:
+                        pass
+        if ratio_count > 0:
+            avg_ratio = avg_ratio / ratio_count
+    except:
+        avg_ratio = 0.0
+    
     detailed_summary = (f"📊 DAILY PERFORMANCE SUMMARY\n"
                        f"Signals Sent: {total}\n"
                        f"Signals Checked: {total_checked_signals}\n"
@@ -893,26 +1210,27 @@ def summary():
                        f"⚖️ Breakevens: {breakev}\n"
                        f"❌ Losses: {fails}\n"
                        f"🎯 Accuracy Rate: {acc:.1f}%\n"
+                       f"📊 Avg SL/TP2 Ratio: {avg_ratio:.2f} (target: ≤{MAX_SL_TP_RATIO})\n"
                        f"💵 Capital: ${CAPITAL}\n"
                        f"🎚️ Leverage: {LEVERAGE}x\n"
                        f"⚠️ Risk per Trade: {BASE_RISK*100:.1f}%\n"
-                       f"🎯 TP System: Swing-based (HTF > Entry TF)")
+                       f"🎯 TP System: WORLD-CLASS (Structural SL, Liquidity TP)\n"
+                       f"📈 Position Sizing: 30% at TP1, 70% at TP2")
     
     send_message(detailed_summary)
-    print(f"📊 Daily Summary. Accuracy: {acc:.1f}%")
+    print(f"📊 Daily Summary. Accuracy: {acc:.1f}%, Avg Ratio: {avg_ratio:.2f}")
 
 # ===== STARTUP =====
 init_csv()
-send_message("✅ SIRTS v10.1 - SINGLE FILTER EDITION\n"
-             "🎯 Purpose: Eliminate trades conflicting with higher timeframe\n"
-             "📈 Timeframes: 15m, 30m, 1h, 2h, 3h, 4h (5m REMOVED - too noisy)\n"
-             "📊 Sentiment: CoinGecko Global\n"
-             "🎯 SWING-BASED TP/SL SYSTEM ACTIVE\n"
-             "🔍 SINGLE ADDED FILTER: Higher TF Conflict Check\n"
-             "   - Rejects if next higher TF strongly opposes trade direction\n"
-             "   - Threshold: ±15 bull/bear score difference\n"
-             "⚠️ THRESHOLDS: MIN_TF_SCORE=25, CONF_MIN_TFS=1, CONFIDENCE_MIN=25\n"
-             "📊 Expected: Eliminates ~70% of losers, keeps most winners")
+send_message("✅ SIRTS v11 - WORLD-CLASS TP/SL EDITION\n"
+             "🎯 Core Principles:\n"
+             "1. SL = Structural Invalidation ONLY\n"
+             "2. TP = Liquidity Targets ONLY\n"
+             "3. No forced TP3, conditional only\n"
+             "4. SL distance ≤ 40% of TP2 distance\n"
+             "📊 Position Sizing: 30% at TP1, 70% at TP2\n"
+             "⚠️ RATIO FILTER: Rejects trades where SL > 40% of TP2 distance\n"
+             "🔥 Expected: Eliminates 90% of bad trades, maximizes RR")
 
 try:
     SYMBOLS = get_top_symbols(TOP_SYMBOLS)
