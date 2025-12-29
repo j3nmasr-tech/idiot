@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-# SIRTS v11 - WORLD-CLASS TP/SL EDITION (NO ATR FALLBACK)
+# SIRTS v11 - INSTITUTIONAL TP ENGINE EDITION
 # Core principles:
 # 1. SL = Structural Invalidation ONLY
-# 2. TP = Liquidity Targets ONLY (NO TRADE IF NO LIQUIDITY)
-# 3. No forced TP3, conditional only
-# 4. SL distance must be <= 40% of TP2 distance
-# 5. REJECT TRADE IF NO LIQUIDITY TARGETS FOUND
+# 2. TP = 5-Tier Priority Hierarchy (Liquidity → Structure → Inefficiency → Mean → Volatility)
+# 3. TP1 = Certainty Target (high probability)
+# 4. TP2 = Structural Target (main objective)
+# 5. TP3 = Extension Target (optional runner)
+# 6. Trade Quality Grading (A/B/C)
 
 import os
 import re
@@ -46,18 +47,37 @@ CONF_MIN_TFS  = 1
 CONFIDENCE_MIN = 25.0
 TOP_SYMBOLS = 60
 
-# ===== WORLD-CLASS TP/SL PARAMETERS =====
+# ===== INSTITUTIONAL TP ENGINE PARAMETERS =====
 MAX_SL_TP_RATIO = 0.4  # SL distance <= 40% of TP2 distance
 ATR_PADDING_FACTOR = 0.35  # ATR padding for SL (0.25-0.5)
 TP1_SIZE_RATIO = 0.3  # Take 30% at TP1
 TP2_SIZE_RATIO = 0.7  # Take 70% at TP2 (main target)
+
+# TP Hierarchy Constants
+TP_HIERARCHY = {
+    "priority_1": "LIQUIDITY",
+    "priority_2": "STRUCTURAL_EXPANSION", 
+    "priority_3": "INEFFICIENCY",
+    "priority_4": "MEAN_MAGNET",
+    "priority_5": "VOLATILITY_BASED"
+}
+
+# TP Allocation Strategy
+TP1_CERTAINTY_MIN_RR = 1.5  # Minimum 1.5:1 RR for TP1
+TP2_STRUCTURAL_MIN_RR = 2.5  # Minimum 2.5:1 RR for TP2
+TP3_EXTENSION_MIN_RR = 4.0  # Minimum 4.0:1 RR for TP3
+
+# Quality Grading
+QUALITY_A = "A"  # Multiple high-priority targets, clear structure
+QUALITY_B = "B"  # Good targets but mixed priorities  
+QUALITY_C = "C"  # Lower-priority targets, reduced confidence
 
 # ===== BYBIT ENDPOINTS =====
 BYBIT_KLINES = "https://api.bybit.com/v5/market/kline"
 BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
 COINGECKO_GLOBAL = "https://api.coingecko.com/api/v3/global"
 
-LOG_CSV = "./sirts_v11_no_atr_fallback.csv"
+LOG_CSV = "./sirts_v11_institutional_tp.csv"
 
 # ===== CACHE =====
 SENTIMENT_CACHE = {"data": None, "timestamp": 0}
@@ -313,7 +333,7 @@ def volume_ok(df):
     current = df["volume"].iloc[-1]
     return current > ma * 1.3
 
-# ===== WORLD-CLASS STRUCTURAL ANALYSIS FUNCTIONS =====
+# ===== INSTITUTIONAL STRUCTURAL ANALYSIS FUNCTIONS =====
 def find_structural_levels(df, timeframe, direction):
     """
     Find key structural levels for SL placement:
@@ -367,78 +387,8 @@ def find_structural_levels(df, timeframe, direction):
     
     return levels
 
-def find_liquidity_levels(df, higher_tf, direction):
-    """
-    Find liquidity targets for TP:
-    - Equal highs/lows
-    - HTF swing points
-    - Previous major highs/lows
-    """
-    targets = []
-    
-    # Internal liquidity (TP1) - Entry timeframe
-    if len(df) >= 30:
-        if direction == "BUY":
-            # Look for equal highs (previous minor highs)
-            recent_highs = df['high'].iloc[-30:].tolist()
-            for i in range(len(recent_highs) - 5, len(recent_highs) - 1):
-                if recent_highs[i] > max(recent_highs[i-3:i]) and recent_highs[i] > max(recent_highs[i+1:i+4]):
-                    targets.append({
-                        'price': recent_highs[i],
-                        'type': 'internal_liquidity',
-                        'timeframe': 'entry',
-                        'priority': 'tp1'
-                    })
-        else:  # SELL
-            # Look for equal lows (previous minor lows)
-            recent_lows = df['low'].iloc[-30:].tolist()
-            for i in range(len(recent_lows) - 5, len(recent_lows) - 1):
-                if recent_lows[i] < min(recent_lows[i-3:i]) and recent_lows[i] < min(recent_lows[i+1:i+4]):
-                    targets.append({
-                        'price': recent_lows[i],
-                        'type': 'internal_liquidity',
-                        'timeframe': 'entry',
-                        'priority': 'tp1'
-                    })
-    
-    # External liquidity (TP2) - from higher timeframe
-    if higher_tf is not None and len(higher_tf) >= 50:
-        if direction == "BUY":
-            # Find previous swing highs on HTF
-            for i in range(len(higher_tf) - 15, len(higher_tf) - 5):
-                if (higher_tf['high'].iloc[i] > higher_tf['high'].iloc[i-5:i].max() and 
-                    higher_tf['high'].iloc[i] > higher_tf['high'].iloc[i+1:i+6].max()):
-                    targets.append({
-                        'price': higher_tf['high'].iloc[i],
-                        'type': 'external_liquidity',
-                        'timeframe': 'htf',
-                        'priority': 'tp2'
-                    })
-        else:  # SELL
-            # Find previous swing lows on HTF
-            for i in range(len(higher_tf) - 15, len(higher_tf) - 5):
-                if (higher_tf['low'].iloc[i] < higher_tf['low'].iloc[i-5:i].min() and 
-                    higher_tf['low'].iloc[i] < higher_tf['low'].iloc[i+1:i+6].min()):
-                    targets.append({
-                        'price': higher_tf['low'].iloc[i],
-                        'type': 'external_liquidity',
-                        'timeframe': 'htf',
-                        'priority': 'tp2'
-                    })
-    
-    # Remove duplicates and sort
-    unique_targets = {}
-    for target in targets:
-        key = round(target['price'], 4)
-        if key not in unique_targets:
-            unique_targets[key] = target
-    
-    return sorted(unique_targets.values(), key=lambda x: (
-        x['priority'] == 'tp2',  # TP2 first
-        x['price'] if direction == "BUY" else -x['price']
-    ))
-
 def get_atr(symbol, period=14):
+    """Calculate Average True Range"""
     symbol = sanitize_symbol(symbol)
     if not symbol:
         return None
@@ -455,30 +405,610 @@ def get_atr(symbol, period=14):
         return None
     return max(float(np.mean(trs)), 1e-8)
 
-def calculate_sl_tp_world_class(symbol, entry_price, direction, entry_tf):
+# ===== INSTITUTIONAL TP ENGINE - 5-TIER HIERARCHY =====
+def find_liquidity_levels_pro(df, higher_tf, direction):
     """
-    WORLD-CLASS TP/SL Calculation:
-    1. SL at structural invalidation + ATR padding
-    2. TP1 at internal liquidity
-    3. TP2 at external liquidity (HTF)
-    4. TP3 only if strong trend and liquidity beyond
-    5. Validate SL <= 40% of TP2 distance
-    6. REJECT TRADE IF NO LIQUIDITY TARGETS FOUND
+    PRIORITY 1: Professional Liquidity Detection
+    Returns liquidity targets with strength scoring
     """
-    # Get entry TF data for structure
+    targets = []
+    
+    if len(df) >= 30:
+        # Internal liquidity (Entry TF)
+        if direction == "BUY":
+            # Look for equal highs
+            recent_highs = df['high'].iloc[-30:].tolist()
+            for i in range(len(recent_highs) - 5, len(recent_highs) - 1):
+                if recent_highs[i] > max(recent_highs[i-3:i]) and recent_highs[i] > max(recent_highs[i+1:i+4]):
+                    targets.append({
+                        'price': recent_highs[i],
+                        'type': 'liquidity',
+                        'subtype': 'equal_high',
+                        'timeframe': 'entry',
+                        'strength': 0.9
+                    })
+        else:  # SELL
+            # Look for equal lows
+            recent_lows = df['low'].iloc[-30:].tolist()
+            for i in range(len(recent_lows) - 5, len(recent_lows) - 1):
+                if recent_lows[i] < min(recent_lows[i-3:i]) and recent_lows[i] < min(recent_lows[i+1:i+4]):
+                    targets.append({
+                        'price': recent_lows[i],
+                        'type': 'liquidity',
+                        'subtype': 'equal_low',
+                        'timeframe': 'entry',
+                        'strength': 0.9
+                    })
+    
+    # External liquidity (Higher TF)
+    if higher_tf is not None and len(higher_tf) >= 50:
+        if direction == "BUY":
+            # Find previous swing highs on HTF
+            for i in range(len(higher_tf) - 15, len(higher_tf) - 5):
+                if (higher_tf['high'].iloc[i] > higher_tf['high'].iloc[i-5:i].max() and 
+                    higher_tf['high'].iloc[i] > higher_tf['high'].iloc[i+1:i+6].max()):
+                    targets.append({
+                        'price': higher_tf['high'].iloc[i],
+                        'type': 'liquidity',
+                        'subtype': 'htf_swing_high',
+                        'timeframe': 'htf',
+                        'strength': 1.0  # Highest strength
+                    })
+        else:  # SELL
+            # Find previous swing lows on HTF
+            for i in range(len(higher_tf) - 15, len(higher_tf) - 5):
+                if (higher_tf['low'].iloc[i] < higher_tf['low'].iloc[i-5:i].min() and 
+                    higher_tf['low'].iloc[i] < higher_tf['low'].iloc[i+1:i+6].min()):
+                    targets.append({
+                        'price': higher_tf['low'].iloc[i],
+                        'type': 'liquidity',
+                        'subtype': 'htf_swing_low',
+                        'timeframe': 'htf',
+                        'strength': 1.0
+                    })
+    
+    return targets
+
+def find_structural_expansion_targets(df, higher_tf_df, direction, entry_price):
+    """
+    PRIORITY 2: Structural Expansion Targets
+    - Measured moves of last impulse
+    - Break→Pullback→Continuation projections
+    - Previous range high/low
+    - BOS (Break of Structure) targets
+    """
+    targets = []
+    
+    if len(df) < 30:
+        return targets
+    
+    current_price = df['close'].iloc[-1]
+    
+    # 1. MEASURED MOVE (Most Professional)
+    if len(df) >= 50:
+        # Find last significant impulse (last 30-10 candles)
+        impulse_high = df['high'].iloc[-30:-10].max()
+        impulse_low = df['low'].iloc[-30:-10].min()
+        impulse_range = impulse_high - impulse_low
+        
+        if direction == "BUY" and impulse_range > 0:
+            measured_move = current_price + impulse_range
+            if measured_move > entry_price * 1.01:  # At least 1% profit
+                targets.append({
+                    'price': measured_move,
+                    'type': 'structural_expansion',
+                    'subtype': 'measured_move',
+                    'confidence': min(impulse_range / current_price * 100, 1.0)
+                })
+        elif direction == "SELL" and impulse_range > 0:
+            measured_move = current_price - impulse_range
+            if measured_move < entry_price * 0.99:
+                targets.append({
+                    'price': measured_move,
+                    'type': 'structural_expansion',
+                    'subtype': 'measured_move',
+                    'confidence': min(impulse_range / current_price * 100, 1.0)
+                })
+    
+    # 2. PREVIOUS RANGE HIGH/LOW
+    if len(df) >= 40:
+        recent_high = df['high'].iloc[-40:-5].max()
+        recent_low = df['low'].iloc[-40:-5].min()
+        recent_mid = (recent_high + recent_low) / 2
+        
+        if direction == "BUY":
+            if recent_high > entry_price * 1.005:
+                targets.append({
+                    'price': recent_high,
+                    'type': 'structural_expansion',
+                    'subtype': 'previous_range_high',
+                    'confidence': 0.7
+                })
+            if recent_mid > entry_price * 1.002:
+                targets.append({
+                    'price': recent_mid,
+                    'type': 'structural_expansion',
+                    'subtype': 'range_midpoint',
+                    'confidence': 0.6
+                })
+        else:  # SELL
+            if recent_low < entry_price * 0.995:
+                targets.append({
+                    'price': recent_low,
+                    'type': 'structural_expansion',
+                    'subtype': 'previous_range_low',
+                    'confidence': 0.7
+                })
+            if recent_mid < entry_price * 0.998:
+                targets.append({
+                    'price': recent_mid,
+                    'type': 'structural_expansion',
+                    'subtype': 'range_midpoint',
+                    'confidence': 0.6
+                })
+    
+    # 3. BOS (Break of Structure) Targets from Higher TF
+    if higher_tf_df is not None and len(higher_tf_df) >= 20:
+        htf_high = higher_tf_df['high'].iloc[-20:-5].max()
+        htf_low = higher_tf_df['low'].iloc[-20:-5].min()
+        
+        if direction == "BUY" and htf_high > entry_price * 1.01:
+            targets.append({
+                'price': htf_high,
+                'type': 'structural_expansion',
+                'subtype': 'htf_structure_high',
+                'confidence': 0.8
+            })
+        elif direction == "SELL" and htf_low < entry_price * 0.99:
+            targets.append({
+                'price': htf_low,
+                'type': 'structural_expansion',
+                'subtype': 'htf_structure_low',
+                'confidence': 0.8
+            })
+    
+    return targets
+
+def find_inefficiency_targets(df, direction, entry_price):
+    """
+    PRIORITY 3: Inefficiency/Imbalance Completion
+    - Fair Value Gaps (FVGs)
+    - Single-print / thin areas
+    - Fast impulse without rebalance
+    """
+    targets = []
+    
+    if len(df) < 15:
+        return targets
+    
+    # Detect Fair Value Gaps (3-candle pattern)
+    for i in range(len(df) - 3, max(len(df) - 10, 2), -1):
+        if i < 2:
+            continue
+            
+        candle1 = df.iloc[i-2]
+        candle2 = df.iloc[i-1]
+        candle3 = df.iloc[i]
+        
+        # Bullish FVG: candle1 low > candle3 high
+        if direction == "BUY":
+            if candle1['low'] > candle3['high']:
+                fvg_mid = (candle1['low'] + candle3['high']) / 2
+                if fvg_mid > entry_price * 1.002:
+                    targets.append({
+                        'price': fvg_mid,
+                        'type': 'inefficiency',
+                        'subtype': 'bullish_fvg',
+                        'urgency': 0.9  # High urgency to fill
+                    })
+        
+        # Bearish FVG: candle1 high < candle3 low
+        elif direction == "SELL":
+            if candle1['high'] < candle3['low']:
+                fvg_mid = (candle1['high'] + candle3['low']) / 2
+                if fvg_mid < entry_price * 0.998:
+                    targets.append({
+                        'price': fvg_mid,
+                        'type': 'inefficiency',
+                        'subtype': 'bearish_fvg',
+                        'urgency': 0.9
+                    })
+    
+    # Single-print areas (thin liquidity)
+    if len(df) >= 20:
+        recent_volumes = df['volume'].iloc[-20:].values
+        volume_mean = np.mean(recent_volumes)
+        volume_std = np.std(recent_volumes)
+        
+        for i in range(len(df) - 5, len(df) - 1):
+            if df['volume'].iloc[i] < volume_mean - (volume_std * 0.5):
+                # Thin volume area - price likely to revisit
+                if direction == "BUY":
+                    target_price = df['high'].iloc[i]
+                    if target_price > entry_price * 1.003:
+                        targets.append({
+                            'price': target_price,
+                            'type': 'inefficiency',
+                            'subtype': 'single_print_high',
+                            'urgency': 0.7
+                        })
+                else:
+                    target_price = df['low'].iloc[i]
+                    if target_price < entry_price * 0.997:
+                        targets.append({
+                            'price': target_price,
+                            'type': 'inefficiency',
+                            'subtype': 'single_print_low',
+                            'urgency': 0.7
+                        })
+    
+    return targets
+
+def find_mean_magnet_targets(df, direction, entry_price):
+    """
+    PRIORITY 4: Mean/Magnet Levels
+    - VWAP approximation
+    - Session mean
+    - Range midpoint
+    - Previous close/open
+    """
+    targets = []
+    
+    if len(df) < 20:
+        return targets
+    
+    current_price = df['close'].iloc[-1]
+    
+    # 1. VWAP Approximation (using typical price)
+    typical_price = (df['high'] + df['low'] + df['close']) / 3
+    vwap = (typical_price * df['volume']).sum() / df['volume'].sum()
+    
+    if direction == "BUY" and vwap > entry_price * 1.002:
+        targets.append({
+            'price': vwap,
+            'type': 'mean_magnet',
+            'subtype': 'vwap_approximation',
+            'magnetism': 0.8
+        })
+    elif direction == "SELL" and vwap < entry_price * 0.998:
+        targets.append({
+            'price': vwap,
+            'type': 'mean_magnet',
+            'subtype': 'vwap_approximation',
+            'magnetism': 0.8
+        })
+    
+    # 2. Session Mean (last 20 candles)
+    session_high = df['high'].iloc[-20:].max()
+    session_low = df['low'].iloc[-20:].min()
+    session_mean = (session_high + session_low) / 2
+    
+    if direction == "BUY" and session_mean > entry_price * 1.001:
+        targets.append({
+            'price': session_mean,
+            'type': 'mean_magnet',
+            'subtype': 'session_mean',
+            'magnetism': 0.6
+        })
+    elif direction == "SELL" and session_mean < entry_price * 0.999:
+        targets.append({
+            'price': session_mean,
+            'type': 'mean_magnet',
+            'subtype': 'session_mean',
+            'magnetism': 0.6
+        })
+    
+    # 3. Previous Close
+    prev_close = df['close'].iloc[-2]
+    if direction == "BUY" and prev_close > entry_price * 1.001:
+        targets.append({
+            'price': prev_close,
+            'type': 'mean_magnet',
+            'subtype': 'previous_close',
+            'magnetism': 0.5
+        })
+    elif direction == "SELL" and prev_close < entry_price * 0.999:
+        targets.append({
+            'price': prev_close,
+            'type': 'mean_magnet',
+            'subtype': 'previous_close',
+            'magnetism': 0.5
+        })
+    
+    return targets
+
+def find_volatility_targets(symbol, entry_price, direction, timeframe):
+    """
+    PRIORITY 5: Volatility-Based Targets (Professional Use Only)
+    - Partial ATR expansion
+    - Volatility compression release
+    - Used ONLY when no better targets exist
+    """
+    targets = []
+    
+    atr_value = get_atr(symbol)
+    if atr_value is None:
+        atr_value = entry_price * 0.01  # Fallback 1%
+    
+    # Conservative ATR multiples (not retail style)
+    atr_multipliers = {
+        'tp1': 0.5,   # Half ATR for TP1
+        'tp2': 1.0,   # Full ATR for TP2
+        'tp3': 1.8    # Extended for TP3
+    }
+    
+    if direction == "BUY":
+        tp1_vol = entry_price + (atr_value * atr_multipliers['tp1'])
+        tp2_vol = entry_price + (atr_value * atr_multipliers['tp2'])
+        tp3_vol = entry_price + (atr_value * atr_multipliers['tp3'])
+    else:  # SELL
+        tp1_vol = entry_price - (atr_value * atr_multipliers['tp1'])
+        tp2_vol = entry_price - (atr_value * atr_multipliers['tp2'])
+        tp3_vol = entry_price - (atr_value * atr_multipliers['tp3'])
+    
+    # Only add if they make sense (minimum profit)
+    if direction == "BUY":
+        if tp1_vol > entry_price * 1.005:
+            targets.append({
+                'price': tp1_vol,
+                'type': 'volatility',
+                'subtype': 'atr_50pct'
+            })
+        if tp2_vol > entry_price * 1.01:
+            targets.append({
+                'price': tp2_vol,
+                'type': 'volatility',
+                'subtype': 'atr_100pct'
+            })
+        if tp3_vol > entry_price * 1.02:
+            targets.append({
+                'price': tp3_vol,
+                'type': 'volatility',
+                'subtype': 'atr_180pct'
+            })
+    else:
+        if tp1_vol < entry_price * 0.995:
+            targets.append({
+                'price': tp1_vol,
+                'type': 'volatility',
+                'subtype': 'atr_50pct'
+            })
+        if tp2_vol < entry_price * 0.99:
+            targets.append({
+                'price': tp2_vol,
+                'type': 'volatility',
+                'subtype': 'atr_100pct'
+            })
+        if tp3_vol < entry_price * 0.98:
+            targets.append({
+                'price': tp3_vol,
+                'type': 'volatility',
+                'subtype': 'atr_180pct'
+            })
+    
+    return targets
+
+def select_institutional_targets(all_targets, entry_price, direction, sl):
+    """
+    Select TP1, TP2, TP3 from all available targets using institutional logic
+    """
+    # Sort targets by priority (type) and strength
+    priority_order = {
+        'liquidity': 1,
+        'structural_expansion': 2,
+        'inefficiency': 3,
+        'mean_magnet': 4,
+        'volatility': 5
+    }
+    
+    def target_sort_key(t):
+        priority = priority_order.get(t['type'], 6)
+        strength = t.get('strength', t.get('confidence', t.get('urgency', t.get('magnetism', 0))))
+        return (priority, -strength)
+    
+    sorted_targets = sorted(all_targets, key=target_sort_key)
+    
+    tp1 = None
+    tp2 = None
+    tp3 = None
+    tp_sources = {
+        'tp1': {'type': 'NOT_FOUND', 'subtype': ''},
+        'tp2': {'type': 'NOT_FOUND', 'subtype': ''},
+        'tp3': {'type': 'NOT_USED', 'subtype': ''}
+    }
+    
+    # Calculate SL distance for RR calculations
+    if sl:
+        if direction == "BUY":
+            sl_distance = entry_price - sl
+        else:
+            sl_distance = sl - entry_price
+    else:
+        sl_distance = 0
+    
+    # Minimum distances based on SL (for RR requirements)
+    if sl_distance > 0:
+        min_tp1_distance = sl_distance * TP1_CERTAINTY_MIN_RR
+        min_tp2_distance = sl_distance * TP2_STRUCTURAL_MIN_RR
+        min_tp3_distance = sl_distance * TP3_EXTENSION_MIN_RR
+    else:
+        # Fallback percentages
+        min_tp1_distance = entry_price * 0.003  # 0.3%
+        min_tp2_distance = entry_price * 0.008  # 0.8%
+        min_tp3_distance = entry_price * 0.015  # 1.5%
+    
+    # TP1: CERTAINTY TARGET (High probability, quick)
+    # Prefer Priority 3-4 for TP1 (inefficiency, mean levels)
+    tp1_candidates = [t for t in sorted_targets 
+                     if t['type'] in ['inefficiency', 'mean_magnet', 'structural_expansion']]
+    
+    for target in tp1_candidates:
+        if direction == "BUY":
+            distance = target['price'] - entry_price
+            if distance >= min_tp1_distance and distance <= min_tp2_distance * 0.7:
+                tp1 = target['price']
+                tp_sources['tp1'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                break
+        else:  # SELL
+            distance = entry_price - target['price']
+            if distance >= min_tp1_distance and distance <= min_tp2_distance * 0.7:
+                tp1 = target['price']
+                tp_sources['tp1'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                break
+    
+    # If no TP1 found from preferred types, try any target
+    if not tp1:
+        for target in sorted_targets:
+            if direction == "BUY":
+                distance = target['price'] - entry_price
+                if distance >= min_tp1_distance:
+                    tp1 = target['price']
+                    tp_sources['tp1'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                    break
+            else:
+                distance = entry_price - target['price']
+                if distance >= min_tp1_distance:
+                    tp1 = target['price']
+                    tp_sources['tp1'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                    break
+    
+    # TP2: STRUCTURAL TARGET (Main objective)
+    # Prefer Priority 1-2 for TP2 (liquidity, structural expansion)
+    tp2_candidates = [t for t in sorted_targets 
+                     if t['type'] in ['liquidity', 'structural_expansion'] and t['price'] != tp1]
+    
+    for target in tp2_candidates:
+        if direction == "BUY":
+            distance = target['price'] - entry_price
+            if distance >= min_tp2_distance:
+                tp2 = target['price']
+                tp_sources['tp2'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                break
+        else:
+            distance = entry_price - target['price']
+            if distance >= min_tp2_distance:
+                tp2 = target['price']
+                tp_sources['tp2'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                break
+    
+    # If no TP2 found from preferred types, try any target (except TP1)
+    if not tp2:
+        for target in sorted_targets:
+            if target['price'] == tp1:
+                continue
+                
+            if direction == "BUY":
+                distance = target['price'] - entry_price
+                if distance >= min_tp2_distance:
+                    tp2 = target['price']
+                    tp_sources['tp2'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                    break
+            else:
+                distance = entry_price - target['price']
+                if distance >= min_tp2_distance:
+                    tp2 = target['price']
+                    tp_sources['tp2'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                    break
+    
+    # TP3: EXTENSION TARGET (Optional runner)
+    # Only look for TP3 if we have TP2
+    if tp2:
+        for target in sorted_targets:
+            if target['price'] in [tp1, tp2]:
+                continue
+                
+            if direction == "BUY":
+                distance = target['price'] - entry_price
+                if distance >= min_tp3_distance and distance > (tp2 - entry_price) * 1.3:
+                    tp3 = target['price']
+                    tp_sources['tp3'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                    break
+            else:
+                distance = entry_price - target['price']
+                if distance >= min_tp3_distance and distance > (entry_price - tp2) * 1.3:
+                    tp3 = target['price']
+                    tp_sources['tp3'] = {'type': target['type'], 'subtype': target.get('subtype', '')}
+                    break
+    
+    return tp1, tp2, tp3, tp_sources
+
+def grade_trade_quality(tp1, tp2, tp3, tp_sources, sl, entry_price, direction):
+    """
+    Grade trade quality A/B/C based on target sources and RR ratios
+    """
+    if not tp2 or not sl:
+        return QUALITY_C, "Insufficient targets or SL"
+    
+    # Calculate Reward:Risk ratios
+    if direction == "BUY":
+        sl_distance = entry_price - sl
+        if tp1:
+            tp1_distance = tp1 - entry_price
+            rr_tp1 = tp1_distance / sl_distance if sl_distance > 0 else 0
+        else:
+            rr_tp1 = 0
+        
+        tp2_distance = tp2 - entry_price
+        rr_tp2 = tp2_distance / sl_distance if sl_distance > 0 else 0
+    else:  # SELL
+        sl_distance = sl - entry_price
+        if tp1:
+            tp1_distance = entry_price - tp1
+            rr_tp1 = tp1_distance / sl_distance if sl_distance > 0 else 0
+        else:
+            rr_tp1 = 0
+        
+        tp2_distance = entry_price - tp2
+        rr_tp2 = tp2_distance / sl_distance if sl_distance > 0 else 0
+    
+    # Extract priority levels from sources
+    priority_order = {'liquidity': 1, 'structural_expansion': 2, 
+                     'inefficiency': 3, 'mean_magnet': 4, 'volatility': 5}
+    
+    tp2_priority = priority_order.get(tp_sources['tp2']['type'], 6)
+    tp1_priority = priority_order.get(tp_sources['tp1']['type'], 6) if tp1 else 6
+    
+    # Quality Grading Logic
+    if tp2_priority <= 2 and rr_tp2 >= 2.5:
+        # Quality A: High priority target with good RR
+        if tp1 and tp1_priority <= 3 and rr_tp1 >= 1.5:
+            return QUALITY_A, "Premium setup: High-priority targets with excellent RR"
+        else:
+            return QUALITY_A, "Strong setup: Main target is high-priority with good RR"
+    
+    elif tp2_priority <= 3 and rr_tp2 >= 2.0:
+        # Quality B: Good setup
+        return QUALITY_B, "Solid setup: Acceptable targets and RR"
+    
+    elif rr_tp2 >= 1.5:
+        # Quality C: Minimum viable
+        return QUALITY_C, "Basic setup: Meets minimum RR requirements"
+    
+    else:
+        return QUALITY_C, "Low-confidence: Poor RR or low-priority targets"
+
+def calculate_sl_tp_institutional(symbol, entry_price, direction, entry_tf):
+    """
+    INSTITUTIONAL TP ENGINE - 5-Tier Priority Hierarchy
+    1. Find structural SL (unchanged - this is correct)
+    2. Use 5-tier hierarchy for TP targets
+    3. Grade trade quality A/B/C
+    4. Never force liquidity, always use best available
+    """
+    # Get entry TF data
     entry_df = get_klines(symbol, entry_tf, limit=100)
     if entry_df is None or len(entry_df) < 50:
         print(f"❌ Insufficient entry data for {symbol} {entry_tf}")
         return None
     
-    # Get higher TF for liquidity targets
+    # Get higher TF for analysis
     tf_index = TIMEFRAMES.index(entry_tf)
     higher_tf_data = None
     if tf_index < len(TIMEFRAMES) - 1:
         higher_tf = TIMEFRAMES[tf_index + 1]
         higher_tf_data = get_klines(symbol, higher_tf, limit=100)
     
-    # Get ATR for padding (for SL only)
+    # Get ATR for SL padding
     atr = get_atr(symbol)
     if atr is None:
         atr = entry_price * 0.005
@@ -495,7 +1025,6 @@ def calculate_sl_tp_world_class(symbol, entry_price, direction, entry_tf):
             structural_sl = valid_swing_lows[0]['price']
             sl_source = f"{entry_tf} swing low"
         else:
-            # No structural level found - REJECT TRADE
             print(f"❌ No structural SL level found for {symbol} {direction}")
             return None
         
@@ -511,108 +1040,48 @@ def calculate_sl_tp_world_class(symbol, entry_price, direction, entry_tf):
             structural_sl = valid_swing_highs[0]['price']
             sl_source = f"{entry_tf} swing high"
         else:
-            # No structural level found - REJECT TRADE
             print(f"❌ No structural SL level found for {symbol} {direction}")
             return None
         
         # Add ATR padding ABOVE structure
         sl = structural_sl + (atr * ATR_PADDING_FACTOR)
     
-    # ===== 2. FIND LIQUIDITY TARGETS =====
-    liquidity_targets = find_liquidity_levels(entry_df, higher_tf_data, direction)
+    # ===== 2. INSTITUTIONAL TP ENGINE - 5-TIER HIERARCHY =====
+    all_targets = []
     
-    if not liquidity_targets:
-        # NO LIQUIDITY TARGETS FOUND - REJECT TRADE
-        print(f"❌ No liquidity targets found for {symbol} {direction} - REJECTING TRADE")
-        return None
+    # TIER 1: Liquidity (if clearly exists)
+    liquidity_targets = find_liquidity_levels_pro(entry_df, higher_tf_data, direction)
+    all_targets.extend(liquidity_targets)
     
-    tp1 = None
-    tp2 = None
-    tp3 = None
-    tp1_source = "no_target_found"
-    tp2_source = "no_target_found"
-    tp3_source = "none"
+    # TIER 2: Structural Expansion
+    expansion_targets = find_structural_expansion_targets(entry_df, higher_tf_data, direction, entry_price)
+    all_targets.extend(expansion_targets)
     
-    # Classify targets
-    tp1_candidates = [t for t in liquidity_targets if t['priority'] == 'tp1']
-    tp2_candidates = [t for t in liquidity_targets if t['priority'] == 'tp2']
+    # TIER 3: Inefficiency/Imbalance
+    inefficiency_targets = find_inefficiency_targets(entry_df, direction, entry_price)
+    all_targets.extend(inefficiency_targets)
     
-    # ===== CRITICAL: MUST HAVE TP2 (Main Liquidity Target) =====
-    if not tp2_candidates:
-        print(f"❌ No external liquidity (TP2) found for {symbol} - REJECTING TRADE")
-        return None
+    # TIER 4: Mean/Magnet Levels
+    mean_targets = find_mean_magnet_targets(entry_df, direction, entry_price)
+    all_targets.extend(mean_targets)
     
-    if direction == "BUY":
-        # TP1: Internal liquidity (closest reasonable target)
-        if tp1_candidates:
-            valid_tp1 = [t for t in tp1_candidates if t['price'] > entry_price * 1.002]
-            if valid_tp1:
-                tp1 = valid_tp1[0]['price']
-                tp1_source = f"internal liquidity ({valid_tp1[0]['type']})"
-        
-        # TP2: External liquidity (main target) - MUST EXIST
-        valid_tp2 = [t for t in tp2_candidates if t['price'] > entry_price * 1.01]
-        if not valid_tp2:
-            print(f"❌ No valid external liquidity above entry for {symbol} - REJECTING TRADE")
-            return None
-        
-        tp2 = valid_tp2[0]['price']
-        tp2_source = f"external liquidity ({valid_tp2[0]['type']})"
-        
-        # TP3: Only if strong trend and more liquidity beyond TP2
-        if entry_df['close'].iloc[-1] > entry_df['close'].iloc[-50:].mean():
-            # Check for even higher HTF levels
-            if tf_index < len(TIMEFRAMES) - 2:
-                even_higher_tf = TIMEFRAMES[tf_index + 2]
-                even_higher_data = get_klines(symbol, even_higher_tf, limit=100)
-                if even_higher_data is not None and len(even_higher_data) >= 50:
-                    swing_highs = find_structural_levels(even_higher_data, even_higher_tf, "SELL")
-                    if swing_highs:
-                        highest_target = max(swing_highs, key=lambda x: x['price'])
-                        if highest_target['price'] > tp2 * 1.05:
-                            tp3 = highest_target['price']
-                            tp3_source = f"{even_higher_tf} swing high"
+    # TIER 5: Volatility-Based (ONLY if insufficient targets)
+    if len(all_targets) < 3:
+        vol_targets = find_volatility_targets(symbol, entry_price, direction, entry_tf)
+        all_targets.extend(vol_targets)
     
-    else:  # SELL
-        # TP1: Internal liquidity
-        if tp1_candidates:
-            valid_tp1 = [t for t in tp1_candidates if t['price'] < entry_price * 0.998]
-            if valid_tp1:
-                tp1 = valid_tp1[0]['price']
-                tp1_source = f"internal liquidity ({valid_tp1[0]['type']})"
-        
-        # TP2: External liquidity (main target) - MUST EXIST
-        valid_tp2 = [t for t in tp2_candidates if t['price'] < entry_price * 0.99]
-        if not valid_tp2:
-            print(f"❌ No valid external liquidity below entry for {symbol} - REJECTING TRADE")
-            return None
-        
-        tp2 = valid_tp2[0]['price']
-        tp2_source = f"external liquidity ({valid_tp2[0]['type']})"
-        
-        # TP3: Only if strong trend
-        if entry_df['close'].iloc[-1] < entry_df['close'].iloc[-50:].mean():
-            if tf_index < len(TIMEFRAMES) - 2:
-                even_higher_tf = TIMEFRAMES[tf_index + 2]
-                even_higher_data = get_klines(symbol, even_higher_tf, limit=100)
-                if even_higher_data is not None and len(even_higher_data) >= 50:
-                    swing_lows = find_structural_levels(even_higher_data, even_higher_tf, "BUY")
-                    if swing_lows:
-                        lowest_target = min(swing_lows, key=lambda x: x['price'])
-                        if lowest_target['price'] < tp2 * 0.95:
-                            tp3 = lowest_target['price']
-                            tp3_source = f"{even_higher_tf} swing low"
+    # ===== 3. SELECT INSTITUTIONAL TARGETS =====
+    tp1, tp2, tp3, tp_sources = select_institutional_targets(
+        all_targets, entry_price, direction, sl
+    )
     
-    # ===== 3. NO TP1 FALLBACK - If no TP1, don't create artificial one =====
-    # Only trade if we have BOTH structural SL AND liquidity TP
-    if tp1 is None:
-        # Don't create artificial TP1 - just skip it, we still have TP2
-        tp1 = None
-        tp1_source = "none"
-        print(f"⚠️ No internal liquidity (TP1) found for {symbol}, proceeding with TP2 only")
+    # ===== 4. QUALITY GRADING =====
+    quality_grade, reasoning = grade_trade_quality(
+        tp1, tp2, tp3, tp_sources, sl, entry_price, direction
+    )
     
-    # ===== 4. VALIDATE WORLD-CLASS RULE: SL <= 40% of TP2 distance =====
-    if tp2 is not None:
+    # ===== 5. VALIDATE WORLD-CLASS RULE: SL <= 40% of TP2 distance =====
+    if tp2:
         if direction == "BUY":
             sl_distance = entry_price - sl
             tp2_distance = tp2 - entry_price
@@ -620,15 +1089,15 @@ def calculate_sl_tp_world_class(symbol, entry_price, direction, entry_tf):
             if sl_distance > 0 and tp2_distance > 0:
                 ratio = sl_distance / tp2_distance
                 
-                # If ratio is too high, adjust TP2 to meet criteria
                 if ratio > MAX_SL_TP_RATIO:
-                    # Find new TP2 that satisfies ratio
+                    # Adjust TP2 to meet ratio (move further away)
                     required_tp2_distance = sl_distance / MAX_SL_TP_RATIO
                     new_tp2 = entry_price + required_tp2_distance
                     
                     if new_tp2 > tp2:
                         tp2 = new_tp2
-                        tp2_source = f"adjusted_for_ratio ({tp2_source.split('(')[0]})"
+                        # Update source to reflect adjustment
+                        tp_sources['tp2'] = {'type': 'adjusted', 'subtype': f"for_ratio_{tp_sources['tp2']['type']}"}
                         print(f"⚠️ Adjusted TP2 for ratio compliance: {ratio:.2f} -> {MAX_SL_TP_RATIO}")
         else:  # SELL
             sl_distance = sl - entry_price
@@ -643,89 +1112,79 @@ def calculate_sl_tp_world_class(symbol, entry_price, direction, entry_tf):
                     
                     if new_tp2 < tp2:
                         tp2 = new_tp2
-                        tp2_source = f"adjusted_for_ratio ({tp2_source.split('(')[0]})"
+                        tp_sources['tp2'] = {'type': 'adjusted', 'subtype': f"for_ratio_{tp_sources['tp2']['type']}"}
                         print(f"⚠️ Adjusted TP2 for ratio compliance: {ratio:.2f} -> {MAX_SL_TP_RATIO}")
     
-    # ===== 5. FINAL VALIDATION =====
+    # ===== 6. FINAL VALIDATION =====
     # Ensure logical order
     if direction == "BUY":
-        if not (sl < entry_price < tp2):
-            print(f"❌ Invalid TP/SL levels for {symbol}: SL={sl}, Entry={entry_price}, TP2={tp2}")
+        if not (sl < entry_price):
+            print(f"❌ Invalid SL for {symbol}: SL={sl}, Entry={entry_price}")
             return None
-        if tp1 and not (entry_price < tp1 < tp2):
+        if tp2 and not (entry_price < tp2):
+            print(f"❌ Invalid TP2 for {symbol}: Entry={entry_price}, TP2={tp2}")
+            return None
+        if tp1 and not (entry_price < tp1 < (tp2 if tp2 else entry_price * 1.05)):
             tp1 = None  # Invalid TP1, remove it
-            tp1_source = "none"
+            tp_sources['tp1'] = {'type': 'INVALID', 'subtype': 'removed'}
     else:  # SELL
-        if not (sl > entry_price > tp2):
-            print(f"❌ Invalid TP/SL levels for {symbol}: SL={sl}, Entry={entry_price}, TP2={tp2}")
+        if not (sl > entry_price):
+            print(f"❌ Invalid SL for {symbol}: SL={sl}, Entry={entry_price}")
             return None
-        if tp1 and not (entry_price > tp1 > tp2):
+        if tp2 and not (entry_price > tp2):
+            print(f"❌ Invalid TP2 for {symbol}: Entry={entry_price}, TP2={tp2}")
+            return None
+        if tp1 and not (entry_price > tp1 > (tp2 if tp2 else entry_price * 0.95)):
             tp1 = None
-            tp1_source = "none"
+            tp_sources['tp1'] = {'type': 'INVALID', 'subtype': 'removed'}
     
     # Round values
     sl = round(sl, 8)
     if tp1:
         tp1 = round(tp1, 8)
-    tp2 = round(tp2, 8)
+    if tp2:
+        tp2 = round(tp2, 8)
     if tp3:
         tp3 = round(tp3, 8)
     
-    # Prepare source dictionary
-    tp_sources = {
+    # Prepare final sources dictionary for logging
+    final_sources = {
         'sl': sl_source,
-        'tp1': tp1_source,
-        'tp2': tp2_source,
-        'tp3': tp3_source
+        'tp1': f"{tp_sources['tp1']['type']}_{tp_sources['tp1']['subtype']}" if tp1 else "NONE",
+        'tp2': f"{tp_sources['tp2']['type']}_{tp_sources['tp2']['subtype']}" if tp2 else "NONE",
+        'tp3': f"{tp_sources['tp3']['type']}_{tp_sources['tp3']['subtype']}" if tp3 else "NONE"
     }
     
-    # Calculate ratio for logging
-    if direction == "BUY":
-        sl_dist = abs(entry_price - sl)
-        tp2_dist = abs(tp2 - entry_price)
-    else:
-        sl_dist = abs(sl - entry_price)
-        tp2_dist = abs(entry_price - tp2)
+    print(f"✅ Institutional TP Engine for {symbol}:")
+    print(f"   Quality: {quality_grade} - {reasoning}")
+    if tp1:
+        print(f"   TP1 ({tp_sources['tp1']['type']}): {tp1}")
+    if tp2:
+        print(f"   TP2 ({tp_sources['tp2']['type']}): {tp2}")
+    if tp3:
+        print(f"   TP3 ({tp_sources['tp3']['type']}): {tp3}")
     
-    ratio = sl_dist / tp2_dist if tp2_dist > 0 else 0
-    
-    print(f"📊 TP/SL Ratio: {ratio:.2f} (max allowed: {MAX_SL_TP_RATIO})")
-    print(f"✅ Found valid liquidity targets for {symbol}")
-    
-    return sl, tp1, tp2, tp3, tp_sources
+    return sl, tp1, tp2, tp3, final_sources, quality_grade, reasoning
 
-# ===== WORLD-CLASS TRADE PARAMS =====
-def trade_params(symbol, entry, side, entry_tf):
+# ===== INSTITUTIONAL TRADE PARAMS =====
+def trade_params_institutional(symbol, entry, side, entry_tf):
     """
-    WORLD-CLASS version using structural invalidation and liquidity targets
-    REJECTS TRADE IF NO LIQUIDITY FOUND
+    INSTITUTIONAL VERSION using 5-tier TP hierarchy
     """
-    # Get world-class TP/SL levels
-    result = calculate_sl_tp_world_class(symbol, entry, side, entry_tf)
+    result = calculate_sl_tp_institutional(symbol, entry, side, entry_tf)
     if not result:
         print(f"❌ Trade rejected for {symbol}: No valid TP/SL structure found")
         return None
     
-    sl, tp1, tp2, tp3, tp_sources = result
+    sl, tp1, tp2, tp3, tp_sources, quality_grade, reasoning = result
     
-    # Get higher timeframe mapping for display
-    tf_index = TIMEFRAMES.index(entry_tf)
-    higher_tfs = {
-        'entry_tf': entry_tf,
-        'tp1_tf': TIMEFRAMES[tf_index] if tp_sources['tp1'].startswith('internal') else 
-                  TIMEFRAMES[min(tf_index + 1, len(TIMEFRAMES) - 1)],
-        'tp2_tf': TIMEFRAMES[min(tf_index + 1, len(TIMEFRAMES) - 1)],
-        'tp3_tf': TIMEFRAMES[min(tf_index + 2, len(TIMEFRAMES) - 1)] if tp3 else None
-    }
-    
-    return sl, tp1, tp2, tp3, tp_sources, higher_tfs
+    return sl, tp1, tp2, tp3, tp_sources, quality_grade, reasoning
 
-# ===== WORLD-CLASS POSITION SIZING =====
-def pos_size_units_world_class(entry, sl, tp2, direction):
+# ===== INSTITUTIONAL POSITION SIZING =====
+def pos_size_units_institutional(entry, sl, tp2, direction, quality_grade):
     """
-    World-class position sizing with ratio validation
+    Institutional position sizing with quality-based risk adjustment
     """
-    # Calculate distances
     if direction == "BUY":
         sl_distance = entry - sl
         tp2_distance = tp2 - entry
@@ -733,7 +1192,7 @@ def pos_size_units_world_class(entry, sl, tp2, direction):
         sl_distance = sl - entry
         tp2_distance = entry - tp2
     
-    # Check world-class rule: SL distance <= 40% of TP2 distance
+    # Check world-class rule
     if sl_distance <= 0 or tp2_distance <= 0:
         print("⚠️ Invalid distances for position sizing")
         return 0.0, 0.0, 0.0, 0.0
@@ -744,16 +1203,22 @@ def pos_size_units_world_class(entry, sl, tp2, direction):
         print(f"❌ Trade rejected: SL/TP2 ratio {ratio:.2f} > {MAX_SL_TP_RATIO}")
         return 0.0, 0.0, 0.0, 0.0
     
-    # Standard position sizing
-    risk_percent = BASE_RISK
-    risk_usd = CAPITAL * risk_percent
+    # Quality-based risk adjustment
+    risk_multiplier = {
+        QUALITY_A: 1.0,  # Full risk for A-grade trades
+        QUALITY_B: 0.7,  # Reduced risk for B-grade
+        QUALITY_C: 0.4   # Minimal risk for C-grade
+    }.get(quality_grade, 0.4)
+    
+    adjusted_risk = BASE_RISK * risk_multiplier
+    risk_usd = CAPITAL * adjusted_risk
     
     # Use the smaller of actual SL distance or ATR-based for safety
     atr = abs(entry - sl) * 2  # Approximate ATR
     safe_sl_dist = min(sl_distance, atr * 0.8)
     
     if safe_sl_dist < entry * 0.0015:
-        return 0.0, 0.0, 0.0, risk_percent
+        return 0.0, 0.0, 0.0, adjusted_risk
     
     units = risk_usd / safe_sl_dist
     exposure = units * entry
@@ -766,15 +1231,14 @@ def pos_size_units_world_class(entry, sl, tp2, direction):
     margin_req = exposure / LEVERAGE
     
     if margin_req < 0.25:
-        return 0.0, 0.0, 0.0, risk_percent
+        return 0.0, 0.0, 0.0, adjusted_risk
     
-    print(f"✅ Position size calculated:")
-    print(f"   SL distance: {sl_distance:.4f} ({sl_distance/entry*100:.2f}%)")
-    print(f"   TP2 distance: {tp2_distance:.4f} ({tp2_distance/entry*100:.2f}%)")
-    print(f"   Ratio: {ratio:.2f} (max: {MAX_SL_TP_RATIO})")
+    print(f"✅ Institutional Position Sizing (Quality: {quality_grade}):")
+    print(f"   Risk: {adjusted_risk*100:.1f}% (Base: {BASE_RISK*100:.1f}% × {risk_multiplier:.1f})")
+    print(f"   SL/TP2 Ratio: {ratio:.2f} (max: {MAX_SL_TP_RATIO})")
     print(f"   Units: {units:.4f}, Exposure: ${exposure:.2f}")
     
-    return round(units, 8), round(margin_req, 6), round(exposure, 6), risk_percent
+    return round(units, 8), round(margin_req, 6), round(exposure, 6), adjusted_risk
 
 # ===== LOGGING =====
 def init_csv():
@@ -783,8 +1247,9 @@ def init_csv():
             writer = csv.writer(f)
             writer.writerow([
                 "timestamp_utc","symbol","side","entry","tp1","tp2","tp3","sl",
-                "tf","units","margin_usd","exposure_usd","risk_pct","confidence_pct","status","breakdown",
-                "tp1_source","tp2_source","tp3_source","sl_source", "sl_tp2_ratio", "reject_reason"
+                "tf","units","margin_usd","exposure_usd","risk_pct","confidence_pct",
+                "quality_grade","status","breakdown","tp1_source","tp2_source",
+                "tp3_source","sl_source","sl_tp2_ratio","reject_reason","reasoning"
             ])
 
 def log_signal(row):
@@ -870,7 +1335,6 @@ def analyze_symbol(symbol):
         return False
     
     # === STEP 3: CALCULATE CONFIDENCE ===
-    # Collect all scores for confidence calculation
     all_scores = []
     for tf in TIMEFRAMES:
         if tf in tf_details and isinstance(tf_details[tf], dict):
@@ -892,15 +1356,13 @@ def analyze_symbol(symbol):
     )
     
     if not filter_result:
-        # Log the filtered signal
         filter_log = f"🚫 FILTERED: {symbol} {chosen_dir} - {filter_reason}"
         print(filter_log)
-        # Log rejection to CSV
         log_signal([
             datetime.utcnow().isoformat(), symbol, chosen_dir, 0,
             0, 0, 0, 0, chosen_tf, 0, 0, 0,
-            0, confidence_pct, "rejected", str(tf_details),
-            "", "", "", "", 0, filter_reason
+            0, confidence_pct, "", "rejected", str(tf_details),
+            "", "", "", "", 0, filter_reason, ""
         ])
         skipped_signals += 1
         return False
@@ -912,8 +1374,8 @@ def analyze_symbol(symbol):
         log_signal([
             datetime.utcnow().isoformat(), symbol, chosen_dir, 0,
             0, 0, 0, 0, chosen_tf, 0, 0, 0,
-            0, confidence_pct, "rejected", str(tf_details),
-            "", "", "", "", 0, "already_have_position"
+            0, confidence_pct, "", "rejected", str(tf_details),
+            "", "", "", "", 0, "already_have_position", ""
         ])
         skipped_signals += 1
         return False
@@ -921,110 +1383,117 @@ def analyze_symbol(symbol):
     # === STEP 6: GET SENTIMENT ===
     sentiment = sentiment_label()
     
-    # === STEP 7: GET CURRENT PRICE AND CALCULATE WORLD-CLASS PARAMS ===
+    # === STEP 7: GET CURRENT PRICE AND CALCULATE INSTITUTIONAL PARAMS ===
     entry = get_price(symbol)
     if entry is None:
         skipped_signals += 1
         return False
     
-    # Get world-class TP/SL levels - THIS WILL REJECT IF NO LIQUIDITY
-    tp_sl_result = trade_params(symbol, entry, chosen_dir, chosen_tf)
+    # Get institutional TP/SL levels
+    tp_sl_result = trade_params_institutional(symbol, entry, chosen_dir, chosen_tf)
     if not tp_sl_result:
-        # Log rejection due to no liquidity
         log_signal([
             datetime.utcnow().isoformat(), symbol, chosen_dir, entry,
             0, 0, 0, 0, chosen_tf, 0, 0, 0,
-            0, confidence_pct, "rejected", str(tf_details),
-            "", "", "", "", 0, "no_liquidity_targets"
+            0, confidence_pct, "", "rejected", str(tf_details),
+            "", "", "", "", 0, "no_valid_structure", ""
         ])
         skipped_signals += 1
         return False
     
-    sl, tp1, tp2, tp3, tp_sources, higher_tfs = tp_sl_result
+    sl, tp1, tp2, tp3, tp_sources, quality_grade, reasoning = tp_sl_result
     
-    # World-class position sizing with ratio validation
-    units, margin, exposure, risk_used = pos_size_units_world_class(
-        entry, sl, tp2, chosen_dir
+    # Institutional position sizing with quality-based risk
+    units, margin, exposure, risk_used = pos_size_units_institutional(
+        entry, sl, tp2, chosen_dir, quality_grade
     )
     
     if units <= 0:
         log_signal([
             datetime.utcnow().isoformat(), symbol, chosen_dir, entry,
             tp1 or 0, tp2, tp3 or 0, sl, chosen_tf, 0, 0, 0,
-            0, confidence_pct, "rejected", str(tf_details),
+            0, confidence_pct, quality_grade, "rejected", str(tf_details),
             tp_sources.get('tp1', ''), tp_sources.get('tp2', ''), 
-            tp_sources.get('tp3', ''), tp_sources.get('sl', ''), 0, "position_size_zero"
+            tp_sources.get('tp3', ''), tp_sources.get('sl', ''), 0, 
+            "position_size_zero", reasoning
         ])
         skipped_signals += 1
         return False
     
-    # === STEP 8: GENERATE DETAILED BREAKDOWN MESSAGE ===
-    breakdown_text = "📊 TIMEFRAME BREAKDOWN:\n"
-    for tf in TIMEFRAMES:
-        if tf in tf_details:
-            if tf_details[tf] == "NO_DATA":
-                breakdown_text += f"• {tf}: ❌ NO DATA\n"
-            else:
-                details = tf_details[tf]
-                breakdown_text += f"• {tf} (${details['price']:.4f}):\n"
-                breakdown_text += f"  Bull: {details['bull_score']:.1f} | Bear: {details['bear_score']:.1f}\n"
-                breakdown_text += f"  Bias: {details['bias'].upper()} | Vol: {'✅' if details['volume_ok'] else '❌'}\n"
-                # Convert boolean to emoji for display
-                crt_icon = "🐮" if details['crt_bull'] else "🐻" if details['crt_bear'] else "➖"
-                turtle_icon = "🐮" if details['turtle_bull'] else "🐻" if details['turtle_bear'] else "➖"
-                breakdown_text += f"  CRT: {crt_icon}\n"
-                breakdown_text += f"  Turtle: {turtle_icon}\n"
-    
-    # Calculate ratio for display
+    # === STEP 8: CALCULATE RR RATIOS ===
     if chosen_dir == "BUY":
         sl_distance = entry - sl
+        if tp1:
+            tp1_distance = tp1 - entry
+            rr_tp1 = tp1_distance / sl_distance if sl_distance > 0 else 0
+        else:
+            rr_tp1 = 0
         tp2_distance = tp2 - entry
+        rr_tp2 = tp2_distance / sl_distance if sl_distance > 0 else 0
     else:
         sl_distance = sl - entry
+        if tp1:
+            tp1_distance = entry - tp1
+            rr_tp1 = tp1_distance / sl_distance if sl_distance > 0 else 0
+        else:
+            rr_tp1 = 0
         tp2_distance = entry - tp2
+        rr_tp2 = tp2_distance / sl_distance if sl_distance > 0 else 0
     
-    ratio = sl_distance / tp2_distance if tp2_distance > 0 else 0
+    sl_tp2_ratio = sl_distance / tp2_distance if tp2_distance > 0 else 0
     
-    # Add WORLD-CLASS TP/SL breakdown
-    breakdown_text += f"\n🎯 WORLD-CLASS TP/SL SYSTEM:\n"
-    breakdown_text += f"• SL: {tp_sources.get('sl', 'Unknown')}\n"
+    # === STEP 9: GENERATE INSTITUTIONAL BREAKDOWN ===
+    breakdown_text = "📊 INSTITUTIONAL TP ENGINE BREAKDOWN:\n"
+    breakdown_text += f"• Trade Quality: {quality_grade}\n"
+    breakdown_text += f"• Reasoning: {reasoning}\n\n"
+    
+    breakdown_text += "🎯 TARGET HIERARCHY USED:\n"
     if tp1:
-        breakdown_text += f"• TP1 (30%): {tp_sources.get('tp1', 'Unknown')}\n"
+        breakdown_text += f"• TP1: {tp_sources['tp1']} (RR: {rr_tp1:.1f}:1)\n"
     else:
-        breakdown_text += f"• TP1: ❌ No internal liquidity found\n"
-    breakdown_text += f"• TP2 (70%): {tp_sources.get('tp2', 'Unknown')}\n"
+        breakdown_text += f"• TP1: No certainty target found\n"
+    breakdown_text += f"• TP2: {tp_sources['tp2']} (RR: {rr_tp2:.1f}:1)\n"
     if tp3:
-        breakdown_text += f"• TP3 (optional): {tp_sources.get('tp3', 'Unknown')}\n"
-    breakdown_text += f"• SL/TP2 Ratio: {ratio:.2f} (max: {MAX_SL_TP_RATIO}) {'✅' if ratio <= MAX_SL_TP_RATIO else '❌'}\n"
-    breakdown_text += f"• 🚫 NO ATR FALLBACK - Trade rejected if no liquidity\n"
+        breakdown_text += f"• TP3: {tp_sources['tp3']} (Runner)\n"
+    else:
+        breakdown_text += f"• TP3: No extension target\n"
+    
+    breakdown_text += f"\n📈 POSITION DETAILS:\n"
+    breakdown_text += f"• Risk: {risk_used*100:.1f}% (Quality: {quality_grade})\n"
+    breakdown_text += f"• SL/TP2 Ratio: {sl_tp2_ratio:.2f} (max: {MAX_SL_TP_RATIO})\n"
+    
+    breakdown_text += f"\n🧠 TIMEFRAME CONFIRMATIONS:\n"
+    for tf in confirming_tfs:
+        if tf in tf_details and isinstance(tf_details[tf], dict):
+            details = tf_details[tf]
+            score = details['bull_score'] if chosen_dir == "BUY" else details['bear_score']
+            breakdown_text += f"• {tf}: {score:.1f}/100\n"
     
     breakdown_text += f"\n🎯 SIGNAL SUMMARY:\n"
     breakdown_text += f"• Direction: {chosen_dir}\n"
-    breakdown_text += f"• Confirmations: {tf_confirmations}/{len(TIMEFRAMES)} TFs\n"
-    breakdown_text += f"• Confirming TFs: {', '.join(confirming_tfs)}\n"
     breakdown_text += f"• Confidence: {confidence_pct:.1f}%\n"
     breakdown_text += f"• Market Sentiment: {sentiment.upper()}\n"
     breakdown_text += f"• Filter Status: {filter_reason}"
     
-    # === STEP 9: SEND TRADE SIGNAL ===
-    header = (f"✅ {chosen_dir} {symbol}\n"
+    # === STEP 10: SEND INSTITUTIONAL TRADE SIGNAL ===
+    header = (f"🏛️ {chosen_dir} {symbol} (Quality: {quality_grade})\n"
               f"💵 Entry: {entry} | TF: {chosen_tf}\n")
     
     if tp1:
-        header += f"🎯 TP1 (30%): {tp1} ({tp_sources.get('tp1', 'Unknown')})\n"
+        header += f"🎯 TP1: {tp1} ({tp_sources['tp1']}) | RR: {rr_tp1:.1f}:1\n"
     else:
-        header += f"🎯 TP1: ❌ No internal liquidity\n"
+        header += f"🎯 TP1: ⚠️ No certainty target\n"
     
-    header += f"🎯 TP2 (70%): {tp2} ({tp_sources.get('tp2', 'Unknown')})\n"
+    header += f"🎯 TP2: {tp2} ({tp_sources['tp2']}) | RR: {rr_tp2:.1f}:1\n"
     
     if tp3:
-        header += f"🎯 TP3 (optional): {tp3} ({tp_sources.get('tp3', 'Unknown')})\n"
+        header += f"🎯 TP3: {tp3} ({tp_sources['tp3']})\n"
     
-    header += (f"🛑 SL: {sl} ({tp_sources.get('sl', 'Unknown')})\n"
-               f"📊 SL/TP2 Ratio: {ratio:.2f} (max: {MAX_SL_TP_RATIO})\n"
-               f"💰 Units:{units:.4f} | Margin≈${margin:.2f} | Exposure≈${exposure:.2f}\n"
+    header += (f"🛑 SL: {sl} ({tp_sources['sl']})\n"
+               f"📊 SL/TP2 Ratio: {sl_tp2_ratio:.2f} (max: {MAX_SL_TP_RATIO})\n"
+               f"💰 Units: {units:.4f} | Margin≈${margin:.2f} | Exposure≈${exposure:.2f}\n"
                f"⚠ Risk: {risk_used*100:.2f}% | Confidence: {confidence_pct:.1f}%\n"
-               f"🧾 TFs confirming: {', '.join(confirming_tfs)}\n"
+               f"🧾 Quality Grade: {quality_grade} | {reasoning[:50]}...\n"
                f"📈 Market Sentiment: {sentiment.upper()}\n"
                f"🔍 FILTER: {filter_reason}")
     
@@ -1032,7 +1501,7 @@ def analyze_symbol(symbol):
     send_message(header)
     send_message(breakdown_text)
     
-    # === STEP 10: RECORD TRADE ===
+    # === STEP 11: RECORD TRADE ===
     trade_obj = {
         "s": symbol,
         "side": chosen_dir,
@@ -1047,6 +1516,7 @@ def analyze_symbol(symbol):
         "exposure": exposure,
         "risk_pct": risk_used,
         "confidence_pct": confidence_pct,
+        "quality_grade": quality_grade,
         "sentiment": sentiment,
         "tp1_taken": False,
         "tp2_taken": False,
@@ -1056,35 +1526,39 @@ def analyze_symbol(symbol):
         "confirming_tfs": confirming_tfs,
         "tf_details": tf_details,
         "tp_sources": tp_sources,
-        "higher_tfs": higher_tfs,
-        "tp1_units": units * TP1_SIZE_RATIO if tp1 else 0,  # Take 30% at TP1 if exists
-        "tp2_units": units * TP2_SIZE_RATIO if tp1 else units,  # All at TP2 if no TP1
-        "tp3_units": 0.0,  # Optional runner
-        "remaining_units": units
+        "reasoning": reasoning,
+        "tp1_units": units * TP1_SIZE_RATIO if tp1 else 0,
+        "tp2_units": units * TP2_SIZE_RATIO if tp1 else units,
+        "tp3_units": 0.0,
+        "remaining_units": units,
+        "rr_tp1": rr_tp1,
+        "rr_tp2": rr_tp2,
+        "sl_tp2_ratio": sl_tp2_ratio
     }
     
     open_trades.append(trade_obj)
     signals_sent_total += 1
     last_trade_time[symbol] = time.time() + 300  # 5-minute cooldown
     
-    # Log with sources and ratio
+    # Log with institutional details
     log_signal([
         datetime.utcnow().isoformat(), symbol, chosen_dir, entry,
         tp1 or 0, tp2, tp3 or 0, sl, chosen_tf, units, margin, exposure,
-        risk_used*100, confidence_pct, "open", str(tf_details),
+        risk_used*100, confidence_pct, quality_grade, "open", str(tf_details),
         tp_sources.get('tp1', ''), tp_sources.get('tp2', ''), 
-        tp_sources.get('tp3', ''), tp_sources.get('sl', ''), ratio, ""
+        tp_sources.get('tp3', ''), tp_sources.get('sl', ''), sl_tp2_ratio, "", reasoning
     ])
     
-    print(f"✅ Signal sent for {symbol} at {entry}. Confidence: {confidence_pct:.1f}%")
+    print(f"✅ Institutional signal sent for {symbol} at {entry}")
+    print(f"   Quality: {quality_grade} - {reasoning}")
     if tp1:
-        print(f"   TP1 (30%): {tp1} ({tp_sources.get('tp1', 'Unknown')})")
-    print(f"   TP2 (70%): {tp2} ({tp_sources.get('tp2', 'Unknown')})")
-    print(f"   SL: {sl} ({tp_sources.get('sl', 'Unknown')})")
-    print(f"   Ratio: {ratio:.2f} (max: {MAX_SL_TP_RATIO})")
+        print(f"   TP1: {tp1} ({tp_sources['tp1']}) | RR: {rr_tp1:.1f}:1")
+    print(f"   TP2: {tp2} ({tp_sources['tp2']}) | RR: {rr_tp2:.1f}:1")
+    print(f"   SL: {sl} ({tp_sources['sl']})")
+    print(f"   Ratio: {sl_tp2_ratio:.2f} (max: {MAX_SL_TP_RATIO})")
     return True
 
-# ===== WORLD-CLASS TRADE CHECKING =====
+# ===== INSTITUTIONAL TRADE CHECKING =====
 def check_trades():
     global signals_hit_total, signals_fail_total, signals_breakeven
     for t in list(open_trades):
@@ -1096,15 +1570,15 @@ def check_trades():
             continue
         
         side = t["side"]
-        tp_sources = t.get("tp_sources", {})
+        quality = t.get("quality_grade", QUALITY_C)
         
         def send_update(message):
-            details = (f"📊 UPDATE: {t['s']}\n"
-                      f"• Side: {t['side']} | Entry: {t['entry']}\n"
-                      f"• Current: {p} | P/L: {(p - t['entry']) / t['entry'] * 100:.2f}%\n"
-                      f"• TP1 Source: {tp_sources.get('tp1', 'Unknown')}\n"
-                      f"• TP2 Source: {tp_sources.get('tp2', 'Unknown')}\n"
-                      f"• SL Source: {tp_sources.get('sl', 'Unknown')}\n"
+            details = (f"📊 INSTITUTIONAL UPDATE: {t['s']}\n"
+                      f"• Side: {t['side']} | Quality: {quality}\n"
+                      f"• Entry: {t['entry']} | Current: {p}\n"
+                      f"• P/L: {(p - t['entry']) / t['entry'] * 100:.2f}%\n"
+                      f"• TP1 Source: {t.get('tp_sources', {}).get('tp1', 'Unknown')}\n"
+                      f"• TP2 Source: {t.get('tp_sources', {}).get('tp2', 'Unknown')}\n"
                       f"{message}")
             send_message(details)
         
@@ -1196,8 +1670,15 @@ def check_trades():
 
 # ===== HEARTBEAT & SUMMARY =====
 def heartbeat():
-    send_message(f"💓 HEARTBEAT OK - {datetime.utcnow().strftime('%H:%M UTC')}\n"
-                f"Active Trades: {len([t for t in open_trades if t['st']=='open'])}\n"
+    active_trades = len([t for t in open_trades if t['st']=='open'])
+    quality_counts = {"A": 0, "B": 0, "C": 0}
+    for t in open_trades:
+        if t['st'] == 'open':
+            quality_counts[t.get('quality_grade', 'C')] += 1
+    
+    send_message(f"💓 INSTITUTIONAL HEARTBEAT - {datetime.utcnow().strftime('%H:%M UTC')}\n"
+                f"Active Trades: {active_trades}\n"
+                f"Quality A: {quality_counts['A']} | B: {quality_counts['B']} | C: {quality_counts['C']}\n"
                 f"Total Signals: {signals_sent_total}")
 
 def summary():
@@ -1207,12 +1688,25 @@ def summary():
     breakev = signals_breakeven
     acc   = (hits / total * 100) if total > 0 else 0.0
     
+    # Calculate quality distribution from logs
+    quality_counts = {"A": 0, "B": 0, "C": 0}
+    try:
+        with open(LOG_CSV, 'r') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('status') == 'open':
+                    quality = row.get('quality_grade', 'C')
+                    if quality in quality_counts:
+                        quality_counts[quality] += 1
+    except:
+        pass
+    
     # Calculate rejection reasons
     rejections = {
-        "no_liquidity": 0,
         "no_structure": 0,
         "ratio_too_high": 0,
-        "filtered": 0
+        "filtered": 0,
+        "position_size": 0
     }
     
     try:
@@ -1221,50 +1715,59 @@ def summary():
             for row in reader:
                 if row.get('status') == 'rejected':
                     reason = row.get('reject_reason', '')
-                    if 'liquidity' in reason.lower():
-                        rejections["no_liquidity"] += 1
-                    elif 'structure' in reason.lower():
+                    if 'structure' in reason.lower():
                         rejections["no_structure"] += 1
                     elif 'ratio' in reason.lower():
                         rejections["ratio_too_high"] += 1
+                    elif 'position' in reason.lower():
+                        rejections["position_size"] += 1
                     else:
                         rejections["filtered"] += 1
     except:
         pass
     
-    detailed_summary = (f"📊 DAILY PERFORMANCE SUMMARY\n"
+    detailed_summary = (f"📊 INSTITUTIONAL PERFORMANCE SUMMARY\n"
                        f"Signals Sent: {total}\n"
-                       f"Signals Checked: {total_checked_signals}\n"
-                       f"Signals Skipped: {skipped_signals}\n"
                        f"✅ Wins: {hits}\n"
                        f"⚖️ Breakevens: {breakev}\n"
                        f"❌ Losses: {fails}\n"
                        f"🎯 Accuracy Rate: {acc:.1f}%\n"
+                       f"\n🏛️ QUALITY DISTRIBUTION:\n"
+                       f"• Grade A: {quality_counts['A']} trades\n"
+                       f"• Grade B: {quality_counts['B']} trades\n"
+                       f"• Grade C: {quality_counts['C']} trades\n"
                        f"\n🚫 REJECTION BREAKDOWN:\n"
-                       f"• No Liquidity Targets: {rejections['no_liquidity']}\n"
-                       f"• No Structural SL: {rejections['no_structure']}\n"
+                       f"• No Structure: {rejections['no_structure']}\n"
                        f"• Ratio Too High: {rejections['ratio_too_high']}\n"
+                       f"• Position Size Zero: {rejections['position_size']}\n"
                        f"• Filtered: {rejections['filtered']}\n"
                        f"\n💵 Capital: ${CAPITAL}\n"
                        f"🎚️ Leverage: {LEVERAGE}x\n"
-                       f"⚠️ Risk per Trade: {BASE_RISK*100:.1f}%\n"
-                       f"🎯 TP System: WORLD-CLASS (NO ATR FALLBACK)\n"
-                       f"📈 Position Sizing: {'30%/70%' if TP1_SIZE_RATIO > 0 else '100% at TP2'}")
+                       f"⚠️ Base Risk: {BASE_RISK*100:.1f}%\n"
+                       f"   (A: {BASE_RISK*100:.1f}%, B: {BASE_RISK*0.7*100:.1f}%, C: {BASE_RISK*0.4*100:.1f}%)\n"
+                       f"🎯 TP System: INSTITUTIONAL 5-TIER HIERARCHY\n"
+                       f"📈 Position Sizing: Quality-based risk adjustment")
     
     send_message(detailed_summary)
-    print(f"📊 Daily Summary. Accuracy: {acc:.1f}%, Rejections: {rejections}")
+    print(f"📊 Institutional Summary. Accuracy: {acc:.1f}%, Quality: {quality_counts}")
 
 # ===== STARTUP =====
 init_csv()
-send_message("✅ SIRTS v11 - WORLD-CLASS TP/SL EDITION (NO ATR FALLBACK)\n"
-             "🎯 Core Principles:\n"
+send_message("✅ SIRTS v11 - INSTITUTIONAL TP ENGINE EDITION\n"
+             "🏛️ Core Principles:\n"
              "1. SL = Structural Invalidation ONLY\n"
-             "2. TP = Liquidity Targets ONLY\n"
-             "3. ❌ NO ATR FALLBACK - Reject trade if no liquidity\n"
-             "4. SL distance ≤ 40% of TP2 distance\n"
-             "📊 Position Sizing: 30% at TP1 (if exists), 70% at TP2\n"
-             "⚠️ STRICT: Rejects trades without structural SL or liquidity TP\n"
-             "🔥 Expected: Only takes HIGH QUALITY trades with clear structure")
+             "2. TP = 5-Tier Priority Hierarchy\n"
+             "3. Quality Grading (A/B/C) with risk adjustment\n"
+             "4. NEVER force liquidity - use best available\n"
+             "\n🎯 TP HIERARCHY:\n"
+             "1. Liquidity (if clearly exists)\n"
+             "2. Structural Expansion (measured moves)\n"
+             "3. Inefficiency Completion (FVGs, imbalances)\n"
+             "4. Mean/Magnet Levels (VWAP, session mean)\n"
+             "5. Volatility-Based (professional fallback)\n"
+             "\n📊 Position Sizing: 30% at TP1 (if exists), 70% at TP2\n"
+             "⚠️ Risk Adjustment: A=100%, B=70%, C=40% of base risk\n"
+             "🔥 Expected: Only HIGH-QUALITY trades with clear structure")
 
 try:
     SYMBOLS = get_top_symbols(TOP_SYMBOLS)
@@ -1277,7 +1780,7 @@ except Exception as e:
 while True:
     try:
         for i, sym in enumerate(SYMBOLS, start=1):
-            print(f"[{i}/{len(SYMBOLS)}] Scanning {sym} …")
+            print(f"[{i}/{len(SYMBOLS)}] Institutional scanning {sym} …")
             try:
                 analyze_symbol(sym)
             except Exception as e:
@@ -1294,7 +1797,7 @@ while True:
             summary()
             last_summary = now
 
-        print(f"Cycle completed at {datetime.utcnow().strftime('%H:%M:%S UTC')}")
+        print(f"Institutional cycle completed at {datetime.utcnow().strftime('%H:%M:%S UTC')}")
         print(f"Active Trades: {len(open_trades)}")
         time.sleep(60)  # Check every minute
         
